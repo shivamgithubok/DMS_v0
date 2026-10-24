@@ -1,0 +1,18 @@
+{
+  "device_name": "dms-orin-nano",
+  "num_threads": 2,
+  "log_level": "warn",
+  "app_data_path": "/opt/dms/data/cochl",
+  "default_hopsize": 0.25,
+  "sensitivity_control": {
+    "default_sensitivity": "NORMAL",
+    "tag_sensitivity": {}
+  },
+  "result_summary": {
+    "enable": false
+  },
+  "audio_preprocessor": {
+    "audio_activity_detection": {"enable": false},
+    "automatic_gain_control": {"enable": true}
+  }
+}

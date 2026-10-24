@@ -1,0 +1,23 @@
+# Driver Monitoring System (bare metal, repo checked out at /opt/dms, set up with ./setup_jetson.sh)
+[Unit]
+Description=Driver Monitoring System
+After=network-online.target nvargus-daemon.service graphical.target dms-vlm.service
+Wants=network-online.target nvargus-daemon.service dms-vlm.service
+
+[Service]
+Type=simple
+User=dms
+WorkingDirectory=/opt/dms
+Environment=DISPLAY=:0
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/default/dms
+ExecStartPre=/opt/dms/tools/build_engines.sh
+ExecStart=/opt/dms/.venv/bin/python /opt/dms/main.py --fullscreen
+Restart=always
+RestartSec=3
+Nice=-5
+CPUWeight=200
+TimeoutStopSec=20
+
+[Install]
+WantedBy=graphical.target

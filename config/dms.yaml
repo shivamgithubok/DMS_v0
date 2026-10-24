@@ -1,0 +1,103 @@
+# Driver Monitoring System - deployment configuration (Jetson Orin Nano 8GB, 15 W).
+# Anything not listed here uses the defaults in dms/config.py.
+# Secrets come from the environment: DMS_MQTT_USERNAME, DMS_MQTT_PASSWORD, COCHL_PROJECT_KEY.
+
+device_id: ""            # empty -> hostname (or DMS_DEVICE_ID)
+log_level: INFO
+
+cameras:
+  driver:                # real-time channel
+    source: auto:0       # auto:<n> (CSI n if present, else n-th USB camera) | csi:<n> | usb:<n> | v4l2:<n>
+                         # | gst:<pipeline> | rtsp://... | file.mp4 | still.jpg
+    width: 640
+    height: 480
+    fps: 30
+    flip: 0              # nvvidconv flip-method (2 = 180 deg for upside-down mounts)
+  passenger:             # cabin / CMS channel
+    source: videos/cabin_passenger.mp4   # looped file for now; use auto:1 for the live camera
+    width: 1280
+    height: 720
+    fps: 25
+    flip: 0
+
+realtime:
+  driver_model: edge_driver_model_distilled_fp16.engine   # built by tools/build_engines.sh
+  driver_model_onnx: edge_driver_model_distilled.onnx     # fallback (ONNX Runtime)
+  landmarks: auto              # auto | mediapipe | lbf
+  ear_threshold: 0.21          # EAR below this = eyes closed (upper bound when auto-calibrating)
+  ear_auto_calibrate: true
+  eyes_closed_s: 1.5           # spec: EAR < threshold for > 1.5 s -> DISTRACTION
+  yaw_threshold_deg: 30        # spec: |yaw| > 30 deg ...
+  head_turn_s: 2.0             # ... for > 2 s -> DISTRACTION
+  phone_s: 1.0
+  gaze_away_deg: 25            # |head yaw + eye-in-head angle| beyond this = eyes off road
+  object_detector_hz: 15       # phone/cup + hand detectors (async thread)
+  mirror: false                # driver camera image mirrored? (labels are driver's left/right)
+  seatbelt_check: true
+  alert_cooldown_s: 8
+
+vlm:
+  enabled: true
+  endpoint: http://127.0.0.1:8080/v1/chat/completions   # llama-server or vLLM (OpenAI API)
+  model: auto                  # auto -> whatever the server reports in /v1/models
+  interval_s: 2.5              # 0.4 Hz
+  timeout_s: 20.0              # vision encode on the Orin often exceeds 3.5 s; the panel shows the real time
+  max_tokens: 80
+  image_width: 448             # per camera tile; the composite is 2 tiles wide
+  thermal_limit_c: 85
+  thermal_backoff: 3.0
+  memory_limit_mb: 7500
+
+audio:
+  enabled: true
+  device: null                 # null = default ALSA capture device; or name/index; or a .wav to replay
+  backend: auto                # auto | cochl | yamnet | dsp
+  hop_s: 0.25
+  scream_threshold: 0.35
+  shout_threshold: 0.35
+  cochl:
+    config_file: config/cochl_config.json
+    scream_tags: [Scream, Screaming, Shout, Yell]
+  kws:
+    enabled: true
+    model_dir: vosk-model-small-en-us-0.15
+    keywords_file: config/abusive_keywords.txt
+
+mqtt:
+  enabled: true
+  host: 127.0.0.1
+  port: 1883
+  topic_prefix: dms
+  heartbeat_s: 30
+  alert_qos: 1
+  heartbeat_qos: 0
+  tls:
+    enabled: false
+    ca_certs: ""
+    certfile: ""
+    keyfile: ""
+
+cms:
+  enabled: true
+  interval_s: 0.5              # cabin worker, off the 15 FPS detector
+  adult_face_ratio: 0.18
+  child_hold_s: 3.0
+  object_hold_s: 2.0
+  occupancy_hold_s: 1.0
+  topic_prefix: cms
+  # Polygons are fractions of the cabin frame. Edit them for the mount.
+  seats:
+    - name: front_passenger
+      polygon: [[0.0, 0.55], [1.0, 0.55], [1.0, 1.0], [0.0, 1.0]]
+    - name: rear_left
+      polygon: [[0.0, 0.0], [0.33, 0.0], [0.33, 0.55], [0.0, 0.55]]
+    - name: rear_center
+      polygon: [[0.33, 0.0], [0.67, 0.0], [0.67, 0.55], [0.33, 0.55]]
+    - name: rear_right
+      polygon: [[0.67, 0.0], [1.0, 0.0], [1.0, 0.55], [0.67, 0.55]]
+
+ui:
+  enabled: true
+  fullscreen: false
+  fps: 20                      # dashboard repaint rate (detector rate is independent)
+  local_alarm: true

@@ -1,0 +1,9 @@
+# Workstation development / CI (x86_64, no GPU needed). Runs everything on ONNX Runtime CPU.
+numpy>=1.26
+opencv-contrib-python-headless==4.10.0.84
+onnxruntime>=1.18
+PyYAML>=6.0
+paho-mqtt==2.1.0
+sounddevice>=0.4.7
+PySide6>=6.8
+pytest>=8

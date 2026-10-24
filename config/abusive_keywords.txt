@@ -1,0 +1,15 @@
+# Keywords for ABUSIVE_LANGUAGE (one per line, lowercase). Every word must exist in the
+# Vosk model's vocabulary; out-of-vocabulary words are ignored by the recognizer.
+# Matched words are masked (f***) in alerts.
+fuck
+fucking
+shit
+bitch
+bastard
+asshole
+damn
+idiot
+moron
+stupid
+dickhead
+bullshit

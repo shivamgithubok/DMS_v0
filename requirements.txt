@@ -1,0 +1,15 @@
+# Driver Monitoring System - required Python packages (Jetson Orin Nano, JetPack 6.x, Python 3.10).
+# Installed by ./setup_jetson.sh into .venv (created with --system-site-packages so JetPack's
+# tensorrt and python3-gi bindings stay visible). Every pin has a manylinux aarch64 cp310 wheel.
+#
+# ONNX Runtime is installed separately by setup_jetson.sh: onnxruntime-gpu (CUDA + TensorRT
+# providers) from the Jetson AI Lab index, falling back to CPU onnxruntime==1.23.2 from PyPI.
+# Optional back-ends are in requirements-optional.txt. torch is not used.
+numpy==1.26.4
+opencv-contrib-python-headless==4.10.0.84   # cv2.face (LBF), ximgproc, FaceDetectorYN, FaceRecognizerSF
+PyYAML==6.0.2
+paho-mqtt==2.1.0
+sounddevice==0.5.1
+PySide6-Essentials==6.8.0.2                 # newest release with a glibc-2.31 aarch64 wheel (JP6 has 2.35)
+protobuf>=4.25.8,<5                         # satisfies both onnxruntime>=1.29 and mediapipe 0.10.18
+flatbuffers>=2.0

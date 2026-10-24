@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Runtime data. Source of truth is config/ plus tools/enroll_driver.py.
+data/*
+*.log
+*.lock
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+
+# Models and engines are downloaded or built on the Jetson.
+models/*
+!models/README.md
+third_party/
+
+# Local camera recordings used as stand-in sources.
+videos/
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Archives and local copies
+*.zip

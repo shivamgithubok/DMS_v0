@@ -1,0 +1,5 @@
+# Optional back-ends: each is detected at start-up and skipped if missing.
+ai-edge-litert==1.2.0     # YAMNet TFLite runtime (audio events)
+vosk==0.3.45              # keyword spotting (ABUSIVE_LANGUAGE)
+# mediapipe==0.10.18 is installed by setup_jetson.sh with --no-deps (478-point face mesh + iris)
+# Cochl.Sense Edge SDK: vendor wheel from the Cochl dashboard (module `sense`)

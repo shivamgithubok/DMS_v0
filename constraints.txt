@@ -1,0 +1,4 @@
+# Keeps later installs (onnxruntime-gpu, optional packages) from pulling NumPy 2 or protobuf 5,
+# which would break mediapipe 0.10.18 and the pinned OpenCV build.
+numpy==1.26.4
+protobuf>=4.25.8,<5
