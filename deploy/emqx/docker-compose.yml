@@ -1,0 +1,22 @@
+# MQTT broker only. Run this on the VPS, not on the Jetson and not on Render.
+# Orin publishes here. Render API subscribes here. The phone never connects.
+
+services:
+  emqx:
+    image: emqx/emqx:5.8.6
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+      - "8883:8883"
+      - "18083:18083"
+    environment:
+      EMQX_NAME: vms
+      EMQX_DASHBOARD__DEFAULT_USERNAME: admin
+      EMQX_DASHBOARD__DEFAULT_PASSWORD: ${EMQX_DASHBOARD_PASSWORD:-changeme-now}
+    volumes:
+      - emqx_data:/opt/emqx/data
+      - emqx_log:/opt/emqx/log
+
+volumes:
+  emqx_data:
+  emqx_log:

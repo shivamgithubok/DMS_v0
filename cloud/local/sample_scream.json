@@ -1,0 +1,13 @@
+{
+  "id": "local-scream-1",
+  "device_id": "orin-nano-01",
+  "type": "SCREAM",
+  "category": "audio",
+  "severity": "high",
+  "confidence": 0.82,
+  "timestamp": "2026-10-26T10:00:00.000+00:00",
+  "epoch_ms": 1761472800000,
+  "description": "Scream detected",
+  "channel": "dms",
+  "reason": "scream"
+}
