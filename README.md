@@ -2,7 +2,34 @@
 
 A complete in-cabin monitoring prototype: real-time driver-state detection (eyes, head pose, gaze, phone, hands, seatbelt, identity), low-rate VLM scene understanding over both cameras, cabin audio events (scream, altercation, abusive language), MQTT store-and-forward uplink, and a PySide6 dashboard laid out like the reference HMI.
 
-![dashboard](docs/dashboard.png)
+## Run on another Jetson
+
+Share this git repo. The other device only needs the files below; cloud, tests, docs, videos, and local `config/dms.yaml` are gitignored.
+
+| Path | Why |
+|---|---|
+| `setup_jetson.sh` | apt, `.venv`, models, TensorRT, llama.cpp |
+| `run.sh` | starts VLM (if present) + DMS |
+| `main.py` `dms/` | detector, CMS, VLM client, MQTT, dashboard |
+| `tools/` | download models, engines, enroll driver, camera check |
+| `requirements.txt` `requirements-optional.txt` `constraints.txt` | Python deps |
+| `config/dms.example.yaml` | copy to `config/dms.yaml` (gitignored) |
+| `config/abusive_keywords.txt` `config/cochl_config.json` | audio |
+| `deploy/dms.cloud.env.example` | MQTT user + `DMS_DEVICE_ID` (copy, do not commit) |
+| `deploy/dms.service` `deploy/dms-vlm.service` | optional autostart |
+
+```bash
+git clone <this-repo> ~/orin-dms && cd ~/orin-dms
+cp config/dms.example.yaml config/dms.yaml   # setup_jetson.sh also does this if missing
+# edit config/dms.yaml: mqtt.host = VPS_IP, cameras if not auto:0 / auto:1
+export DMS_DEVICE_ID=orin-nano-01            # same id as the Guardian ride, or a new unique id
+export DMS_MQTT_USERNAME=dms-orin
+export DMS_MQTT_PASSWORD='<emqx password>'
+./setup_jetson.sh
+./run.sh --mqtt-host VPS_IP --device-id "$DMS_DEVICE_ID"
+```
+
+Guardian app: `EXPO_PUBLIC_TELEMETRY_URL=http://VPS_IP:8000`, leave `EXPO_PUBLIC_MQTT_URL` empty, ride id `ride-1842`. Do not give them the EMQX dashboard password.
 
 ## Architecture
 

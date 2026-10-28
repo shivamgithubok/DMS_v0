@@ -1,0 +1,16 @@
+# Copy the mqtt block into config/dms.yaml on the Jetson after the VPS is up.
+# Do not commit real passwords. Prefer /etc/default/dms for secrets.
+
+mqtt:
+  enabled: true
+  host: REPLACE_WITH_VPS_IP
+  port: 1883
+  topic_prefix: dms
+  heartbeat_s: 30
+  alert_qos: 1
+  heartbeat_qos: 0
+  tls:
+    enabled: false
+    # After you add a certificate on the VPS:
+    # enabled: true
+    # and set port: 8883

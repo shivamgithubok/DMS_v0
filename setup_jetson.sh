@@ -82,6 +82,11 @@ else
   pip install -r requirements-dev.txt
 fi
 
+if [[ ! -f config/dms.yaml ]]; then
+  cp config/dms.example.yaml config/dms.yaml
+  log "wrote config/dms.yaml from example — set mqtt.host (VPS IP) and camera sources"
+fi
+
 log "checking the environment"
 python tools/check_env.py
 

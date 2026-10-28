@@ -1,0 +1,100 @@
+# Copy to config/dms.yaml on each Jetson (that file is gitignored).
+# Secrets stay in the environment: DMS_MQTT_USERNAME, DMS_MQTT_PASSWORD, COCHL_PROJECT_KEY.
+
+device_id: ""            # empty -> hostname (or DMS_DEVICE_ID)
+log_level: INFO
+
+cameras:
+  driver:
+    source: auto:0       # auto:<n> | csi:<n> | usb:<n> | v4l2:<n> | file.mp4 | still.jpg
+    width: 640
+    height: 480
+    fps: 30
+    flip: 0
+  passenger:
+    source: auto:1
+    width: 1280
+    height: 720
+    fps: 25
+    flip: 0
+
+realtime:
+  driver_model: edge_driver_model_distilled_fp16.engine
+  driver_model_onnx: edge_driver_model_distilled.onnx
+  landmarks: auto
+  ear_threshold: 0.21
+  ear_auto_calibrate: true
+  eyes_closed_s: 1.5
+  yaw_threshold_deg: 30
+  head_turn_s: 2.0
+  phone_s: 1.0
+  gaze_away_deg: 25
+  object_detector_hz: 15
+  mirror: false
+  seatbelt_check: true
+  alert_cooldown_s: 8
+
+vlm:
+  enabled: true
+  endpoint: http://127.0.0.1:8080/v1/chat/completions
+  model: auto
+  interval_s: 2.5
+  timeout_s: 20.0
+  max_tokens: 80
+  image_width: 448
+  thermal_limit_c: 85
+  thermal_backoff: 3.0
+  memory_limit_mb: 7500
+
+audio:
+  enabled: true
+  device: null
+  backend: auto
+  hop_s: 0.25
+  scream_threshold: 0.35
+  shout_threshold: 0.35
+  cochl:
+    config_file: config/cochl_config.json
+    scream_tags: [Scream, Screaming, Shout, Yell]
+  kws:
+    enabled: true
+    model_dir: vosk-model-small-en-us-0.15
+    keywords_file: config/abusive_keywords.txt
+
+mqtt:
+  enabled: true
+  host: REPLACE_WITH_VPS_IP
+  port: 1883
+  topic_prefix: dms
+  heartbeat_s: 30
+  alert_qos: 1
+  heartbeat_qos: 0
+  tls:
+    enabled: false
+    ca_certs: ""
+    certfile: ""
+    keyfile: ""
+
+cms:
+  enabled: true
+  interval_s: 0.5
+  adult_face_ratio: 0.18
+  child_hold_s: 3.0
+  object_hold_s: 2.0
+  occupancy_hold_s: 1.0
+  topic_prefix: cms
+  seats:
+    - name: front_passenger
+      polygon: [[0.0, 0.55], [1.0, 0.55], [1.0, 1.0], [0.0, 1.0]]
+    - name: rear_left
+      polygon: [[0.0, 0.0], [0.33, 0.0], [0.33, 0.55], [0.0, 0.55]]
+    - name: rear_center
+      polygon: [[0.33, 0.0], [0.67, 0.0], [0.67, 0.55], [0.33, 0.55]]
+    - name: rear_right
+      polygon: [[0.67, 0.0], [1.0, 0.0], [1.0, 0.55], [0.67, 0.55]]
+
+ui:
+  enabled: true
+  fullscreen: false
+  fps: 20
+  local_alarm: true
