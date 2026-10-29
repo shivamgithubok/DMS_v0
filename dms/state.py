@@ -151,6 +151,12 @@ class VlmState:
     calls: int = 0
     errors: int = 0
     model: str = ""
+    dms_scene: str = ""
+    cms_scene: str = ""
+    dms_description: str = ""
+    cms_description: str = ""
+    dms: dict = field(default_factory=dict)
+    cms: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -164,6 +170,19 @@ class AudioState:
     kws: str = "off"
     latency_ms: float = 0.0
     error: str = ""
+
+
+@dataclass
+class WebRtcState:
+    enabled: bool = False
+    status: str = "off"
+    mode: str = ""
+    api: str = ""
+    url: str = ""
+    room: str = ""
+    seq: int = 0
+    errors: int = 0
+    last_error: str = ""
 
 
 @dataclass
@@ -187,6 +206,7 @@ class SharedState:
         self.vlm = VlmState()
         self.audio = AudioState()
         self.mqtt = MqttState()
+        self.webrtc = WebRtcState()
         self.system = None  # telemetry.SystemStats
         self.hardware = ""
         self.device_id = ""

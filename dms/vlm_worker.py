@@ -74,6 +74,19 @@ class VlmVerdict:
 
 
 @dataclass
+class ChannelAnalysis:
+    """One camera's latest VLM slice (DMS or CMS)."""
+
+    scene: str = ""
+    description: str = ""
+    hazards: list = field(default_factory=list)
+    kept: list = field(default_factory=list)
+    suppressed: list = field(default_factory=list)
+    confidence: float | None = None
+    observations: dict = field(default_factory=dict)
+
+
+@dataclass
 class PolicyDecision:
     """What the safety policy kept from one scene answer."""
 
@@ -81,21 +94,25 @@ class PolicyDecision:
     suppressed: list = field(default_factory=list)  # "hazard: reason"
     scene: str = ""
     line: str = ""
+    dms: ChannelAnalysis = field(default_factory=ChannelAnalysis)
+    cms: ChannelAnalysis = field(default_factory=ChannelAnalysis)
 
 
 # The real-time detector owns driver state. The VLM may only add cabin hazards.
 DRIVER_VLM_CATEGORIES = {"driver_distracted", "other"}
-CABIN_HAZARDS = ("passenger_aggressive", "child_unattended", "objects_blocking_driver")
+CABIN_HAZARDS = ("passenger_aggressive", "child_unattended", "objects_blocking_driver", "weapon_or_smoke")
 _HAZARD_NAMES = set(CABIN_HAZARDS) | DRIVER_VLM_CATEGORIES
 CMS_VLM_CATEGORIES = {
     "passenger_aggressive": (A.PASSENGER_AGGRESSIVE, "passenger_aggressive"),
     "child_unattended": (A.CHILD_PRESENT, "vlm_child"),
     "objects_blocking_driver": (A.OBJECT_ON_SEAT, "vlm_blocking"),
+    "weapon_or_smoke": (A.VLM_ALERT, "weapon_or_smoke"),
 }
 _HAZARD_LABEL = {
     "passenger_aggressive": "passenger aggressive",
     "child_unattended": "child unattended",
     "objects_blocking_driver": "object blocking driver",
+    "weapon_or_smoke": "weapon or smoke",
     "driver_distracted": "driver distracted",
     "other": "other",
 }
@@ -166,14 +183,102 @@ def _json_object(text: str) -> dict | None:
         data = json.loads(text[start:end + 1])
     except json.JSONDecodeError:
         return None
-    if not isinstance(data, dict) or ("scene" not in data and "hazards" not in data):
+    if not isinstance(data, dict):
         return None
-    return data
+    if "dms" in data or "cms" in data or "scene" in data or "hazards" in data:
+        return data
+    return None
 
 
 def _hazard_name(value) -> str:
     name = str(value).strip().lower().replace("-", "_").replace(" ", "_")
     return name if name in _HAZARD_NAMES else ""
+
+
+def _as_hazard_list(value) -> list:
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    found = []
+    for item in value:
+        name = _hazard_name(item)
+        if name and name not in found:
+            found.append(name)
+    return found
+
+
+def _clamp_conf(value, default: float | None = 0.0) -> float | None:
+    if value is None:
+        return default
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _observations_dms(raw) -> dict:
+    raw = raw if isinstance(raw, dict) else {}
+    gaze = str(raw.get("gaze") or "forward").strip() or "forward"
+    lighting = str(raw.get("lighting") or "ok").strip() or "ok"
+    return {
+        "handsOnWheel": bool(raw.get("handsOnWheel", True)),
+        "gaze": gaze,
+        "viewBlocked": bool(raw.get("viewBlocked", False)),
+        "lighting": lighting,
+        "cameraBlocked": bool(raw.get("cameraBlocked", False)),
+    }
+
+
+def _observations_cms(raw) -> dict:
+    raw = raw if isinstance(raw, dict) else {}
+    occ = raw.get("occupants") if isinstance(raw.get("occupants"), dict) else {}
+    aggression = str(raw.get("aggression") or "calm").strip().lower() or "calm"
+    if aggression not in {"calm", "argument", "panic"}:
+        aggression = "calm"
+    try:
+        adults = int(occ.get("adults") or 0)
+    except (TypeError, ValueError):
+        adults = 0
+    try:
+        children = int(occ.get("children") or 0)
+    except (TypeError, ValueError):
+        children = 0
+    return {
+        "occupants": {"adults": max(0, adults), "children": max(0, children)},
+        "childUnattended": bool(raw.get("childUnattended", False)),
+        "aggression": aggression,
+        "viewBlocked": bool(raw.get("viewBlocked", False)),
+        "weaponOrSmoke": bool(raw.get("weaponOrSmoke", False)),
+    }
+
+
+def _cms_from_observations(obs: dict, hazards: list) -> list:
+    extra = list(hazards)
+    if obs.get("childUnattended") and "child_unattended" not in extra:
+        extra.append("child_unattended")
+    if obs.get("aggression") == "panic" and "passenger_aggressive" not in extra:
+        extra.append("passenger_aggressive")
+    if obs.get("viewBlocked") and "objects_blocking_driver" not in extra:
+        extra.append("objects_blocking_driver")
+    if obs.get("weaponOrSmoke") and "weapon_or_smoke" not in extra:
+        extra.append("weapon_or_smoke")
+    return extra
+
+
+def analysis_payload(device_id: str, channel: str, side: ChannelAnalysis, at_ms: int) -> dict:
+    conf = 0.0 if side.confidence is None else float(side.confidence)
+    return {
+        "device_id": device_id,
+        "channel": channel,
+        "at": int(at_ms),
+        "scene": side.scene or "",
+        "description": side.description or "",
+        "hazards": list(side.kept if channel == "cms" else []),
+        "confidence": round(conf, 3),
+        "suppressed": list(side.suppressed),
+        "observations": dict(side.observations or {}),
+    }
 
 
 def _cabin_has(cabin, kind: str) -> bool:
@@ -189,29 +294,41 @@ def _cabin_known(cabin) -> bool:
     )
 
 
-def apply_policy(verdict: VlmVerdict, driver=None, cabin=None, confidence_min: float = 0.55) -> PolicyDecision:
+def apply_policy(verdict: VlmVerdict, driver=None, cabin=None, confidence_min: float = 0.55,
+                 dms: ChannelAnalysis | None = None, cms: ChannelAnalysis | None = None) -> PolicyDecision:
     """Keep cabin hazards the measurements do not contradict. Driver state stays with the detector.
 
     ``driver`` is accepted so a future rule can read it; driver hazards are dropped regardless.
     """
     del driver  # detector owns driver alerts; the argument documents the call site
+    dms_side = dms or ChannelAnalysis(scene=verdict.scene, confidence=verdict.confidence)
+    cms_side = cms or ChannelAnalysis(scene=verdict.scene, hazards=list(verdict.categories),
+                                      confidence=verdict.confidence)
     kept = []
     suppressed = []
     floor = float(confidence_min)
-    for name in verdict.categories:
-        if name in DRIVER_VLM_CATEGORIES:
-            suppressed.append(f"{_label(name)}: detector owns driver state")
-            continue
+    for name in list(dms_side.hazards) or [n for n in verdict.categories if n in DRIVER_VLM_CATEGORIES]:
+        suppressed.append(f"{_label(name)}: detector owns driver state")
+    dms_side.kept = []
+    dms_side.hazards = []
+    dms_side.suppressed = [item for item in suppressed if "detector owns" in item]
+    cms_conf = cms_side.confidence if cms_side.confidence is not None else verdict.confidence
+    names = list(cms_side.hazards) if cms is not None else [n for n in verdict.categories if n not in DRIVER_VLM_CATEGORIES]
+    for name in names:
         if name not in CMS_VLM_CATEGORIES:
             continue
-        if verdict.confidence is not None and verdict.confidence < floor:
-            suppressed.append(f"{_label(name)}: confidence {verdict.confidence:.2f} below {floor:.2f}")
+        if cms_conf is not None and cms_conf < floor:
+            suppressed.append(f"{_label(name)}: confidence {cms_conf:.2f} below {floor:.2f}")
             continue
         if name == "child_unattended" and _cabin_known(cabin) and _cabin_has(cabin, "adult") and not _cabin_has(cabin, "child"):
             suppressed.append(f"{_label(name)}: adult in cabin, no child measured")
             continue
         kept.append(name)
-    scene = (verdict.scene or verdict.summary or "").strip()
+    cms_side.kept = list(kept)
+    cms_side.suppressed = [item for item in suppressed if "detector owns" not in item]
+    scene = (cms_side.scene or dms_side.scene or verdict.scene or verdict.summary or "").strip()
+    cms_side.scene = cms_side.scene or scene
+    dms_side.scene = dms_side.scene or scene
     if kept and suppressed:
         line = "Policy: kept " + ", ".join(_label(n) for n in kept) + " · suppressed " + "; ".join(suppressed)
     elif kept:
@@ -220,44 +337,55 @@ def apply_policy(verdict: VlmVerdict, driver=None, cabin=None, confidence_min: f
         line = "Policy: suppressed " + "; ".join(suppressed)
     else:
         line = "Policy: no extra cabin hazard"
-    return PolicyDecision(kept, suppressed, scene[:160], line)
+    return PolicyDecision(kept, suppressed, scene[:160], line, dms_side, cms_side)
 
 
 def assess(text: str, driver=None, cabin=None, confidence_min: float = 0.55):
     """Parse one answer, apply the safety policy, and list the alerts to emit."""
-    verdict = parse_vlm(text)
-    decision = apply_policy(verdict, driver, cabin, confidence_min)
+    verdict, dms, cms = parse_scene(text)
+    decision = apply_policy(verdict, driver, cabin, confidence_min, dms, cms)
     routed = verdict_alerts(VlmVerdict(bool(decision.kept), list(decision.kept), decision.scene, verdict.confidence, decision.scene))
     return verdict, decision, routed
 
 
 def parse_vlm(text: str) -> VlmVerdict:
-    """Turn a VLM answer into a scene, hazards, and an optional confidence.
+    """Turn a VLM answer into a scene, hazards, and an optional confidence."""
+    return parse_scene(text)[0]
 
-    JSON is preferred. Older SAFE/UNSAFE prose still parses, with confidence left unset.
-    """
+
+def parse_scene(text: str) -> tuple[VlmVerdict, ChannelAnalysis, ChannelAnalysis]:
+    """Parse dual ``dms``/``cms`` JSON, legacy ``{scene,hazards}`` JSON, or SAFE/UNSAFE prose."""
     raw = (text or "").strip()
     raw = re.sub(r"<think>.*?</think>", " ", raw, flags=re.IGNORECASE | re.DOTALL)
     data = _json_object(raw)
+    if data is not None and ("dms" in data or "cms" in data):
+        dms = _side_from_block(data.get("dms"), "dms")
+        cms = _side_from_block(data.get("cms"), "cms")
+        cats = list(dict.fromkeys([*dms.hazards, *cms.hazards]))
+        scene = (cms.scene or dms.scene or "").strip()
+        confs = [c for c in (dms.confidence, cms.confidence) if c is not None]
+        confidence = max(confs) if confs else 0.0
+        summary = scene or re.sub(r"\s+", " ", raw)[:160]
+        return VlmVerdict(bool(cats), cats, summary, confidence, scene or summary), dms, cms
     if data is not None:
         scene = re.sub(r"\s+", " ", str(data.get("scene") or "")).strip()[:160]
-        found = []
-        hazards = data.get("hazards") or []
-        if isinstance(hazards, str):
-            hazards = [hazards]
-        if isinstance(hazards, list):
-            for item in hazards:
-                name = _hazard_name(item)
-                if name and name not in found:
-                    found.append(name)
-        confidence = 0.0
-        try:
-            confidence = float(data.get("confidence", 0.0))
-        except (TypeError, ValueError):
-            confidence = 0.0
-        confidence = max(0.0, min(1.0, confidence))
+        description = re.sub(r"\s+", " ", str(data.get("description") or "")).strip()[:200]
+        found = _as_hazard_list(data.get("hazards"))
+        confidence = _clamp_conf(data.get("confidence"), 0.0)
         summary = scene or re.sub(r"\s+", " ", raw)[:160]
-        return VlmVerdict(bool(found), found, summary, confidence, scene or summary)
+        dms = _side_from_block(
+            {"scene": scene, "description": description,
+             "hazards": [n for n in found if n in DRIVER_VLM_CATEGORIES],
+             "confidence": confidence, "observations": (data.get("observations") or {}).get("dms")},
+            "dms",
+        )
+        cms = _side_from_block(
+            {"scene": scene, "description": description,
+             "hazards": [n for n in found if n not in DRIVER_VLM_CATEGORIES],
+             "confidence": confidence, "observations": data.get("observations")},
+            "cms",
+        )
+        return VlmVerdict(bool(found), found, summary, confidence, scene or summary), dms, cms
     clean = re.sub(r"\s+", " ", raw)
     lower = clean.lower()
     explicit_unsafe = bool(re.match(r"^\W*unsafe\b", lower))
@@ -266,7 +394,8 @@ def parse_vlm(text: str) -> VlmVerdict:
     summary = summary[:160]
     if explicit_safe:
         summary = summary or "SAFE"
-        return VlmVerdict(False, [], summary, None, summary)
+        empty = ChannelAnalysis(scene=summary)
+        return VlmVerdict(False, [], summary, None, summary), empty, ChannelAnalysis(scene=summary)
     found = []
     for category, patterns in CATEGORY_TERMS.items():
         for pattern in patterns:
@@ -281,7 +410,26 @@ def parse_vlm(text: str) -> VlmVerdict:
                 break
     if explicit_unsafe and not found:
         found = ["other"]
-    return VlmVerdict(bool(found), found, summary, None, summary)
+    dms = ChannelAnalysis(scene=summary, hazards=[n for n in found if n in DRIVER_VLM_CATEGORIES])
+    cms = ChannelAnalysis(scene=summary, hazards=[n for n in found if n not in DRIVER_VLM_CATEGORIES])
+    return VlmVerdict(bool(found), found, summary, None, summary), dms, cms
+
+
+def _side_from_block(block, channel: str) -> ChannelAnalysis:
+    block = block if isinstance(block, dict) else {}
+    scene = re.sub(r"\s+", " ", str(block.get("scene") or "")).strip()[:160]
+    description = re.sub(r"\s+", " ", str(block.get("description") or "")).strip()[:200]
+    if description.lower() in {"short", scene.lower()}:
+        description = ""
+    found = _as_hazard_list(block.get("hazards"))
+    confidence = _clamp_conf(block.get("confidence"), 0.0)
+    if channel == "dms":
+        obs = _observations_dms(block.get("observations"))
+        found = [name for name in found if name in DRIVER_VLM_CATEGORIES]
+    else:
+        obs = _observations_cms(block.get("observations"))
+        found = _cms_from_observations(obs, [name for name in found if name in CMS_VLM_CATEGORIES])
+    return ChannelAnalysis(scene=scene, description=description, hazards=found, confidence=confidence, observations=obs)
 
 
 def compose(driver: np.ndarray | None, passenger: np.ndarray | None, width: int) -> np.ndarray | None:
@@ -361,8 +509,10 @@ class VlmWorker(threading.Thread):
         self.client = VlmClient(self.cfg.endpoint, self.cfg.model, self.cfg.api_key, self.cfg.timeout_s)
         self.base_prompt = self.cfg.prompt.strip()
         self.format_hint = (self.cfg.format_hint or "").strip()
-        self.confidence_min = float(self.cfg.get("confidence_min", 0.55))
+        self.confidence_min = float(self.cfg.get("confidence_min", 0.7))
+        self.hold_cycles = max(1, int(self.cfg.get("hold_cycles", 2)))
         self._halt = threading.Event()
+        self._cms_streak: dict[str, int] = {}
         self.calls = 0
         self.errors = 0
         self.latencies: list[float] = []
@@ -460,11 +610,31 @@ class VlmWorker(threading.Thread):
         _parsed, decision, routed = assess(
             text, self.shared.driver, self.shared.passenger, self.confidence_min)
         confidence = 0.0 if _parsed.confidence is None else float(_parsed.confidence)
+        now_kept = set(decision.kept)
+        for name in list(self._cms_streak):
+            if name not in now_kept:
+                del self._cms_streak[name]
+        for name in now_kept:
+            self._cms_streak[name] = self._cms_streak.get(name, 0) + 1
+        confirmed = {name for name, count in self._cms_streak.items() if count >= self.hold_cycles}
+        routed = [
+            item for item in routed
+            if any(spec[1] == item[1] and name in confirmed for name, spec in CMS_VLM_CATEGORIES.items())
+        ]
+        at_ms = int(time.time() * 1000)
         self._publish(status="throttled" if reason else "ok", text=decision.scene, scene=decision.scene,
                       policy=decision.line, unsafe=bool(decision.kept), categories=list(decision.kept),
                       suppressed=list(decision.suppressed), confidence=confidence, latency_s=latency,
-                      latency_avg_s=self._latency_avg(), last_ts=time.time(), interval_s=interval)
-        log.info("VLM %.2fs %s | %s", latency, decision.line, decision.scene)
+                      latency_avg_s=self._latency_avg(), last_ts=time.time(), interval_s=interval,
+                      dms_scene=decision.dms.scene, cms_scene=decision.cms.scene,
+                      dms_description=decision.dms.description, cms_description=decision.cms.description,
+                      dms=analysis_payload(self.shared.device_id or self.bus.device_id, "dms", decision.dms, at_ms),
+                      cms=analysis_payload(self.shared.device_id or self.bus.device_id, "cms", decision.cms, at_ms))
+        log.info("VLM %.2fs %s | dms=%s | cms=%s", latency, decision.line,
+                 f"{decision.dms.scene} | {decision.dms.description}".strip(" |"),
+                 f"{decision.cms.scene} | {decision.cms.description}".strip(" |"))
+        self.bus.emit_analysis("dms", analysis_payload(self.bus.device_id, "dms", decision.dms, at_ms))
+        self.bus.emit_analysis("cms", analysis_payload(self.bus.device_id, "cms", decision.cms, at_ms))
         if routed:
             path = data_path("snapshots", f"{time.strftime('%Y%m%d_%H%M%S')}_vlm.jpg")
             cv2.imwrite(str(path), image, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -472,8 +642,8 @@ class VlmWorker(threading.Thread):
                 self.bus.emit(A.Alert(
                     type=kind, category=A.VISION, channel=channel,
                     confidence=confidence or 0.7, reason=alert_reason,
-                    description=decision.scene, snapshot_path=str(path),
+                    description=decision.cms.scene or decision.scene, snapshot_path=str(path),
                     extra={"categories": list(decision.kept), "suppressed": list(decision.suppressed),
                            "policy": decision.line, "raw": text[:400], "latency_s": round(latency, 2),
                            "model": self.client.model}),
-                    cooldown_s=max(10.0, 3 * interval))
+                    cooldown_s=max(15.0, 3 * interval))

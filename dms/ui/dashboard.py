@@ -669,9 +669,24 @@ class Dashboard(QWidget):
         meta_end = r.right() - 48 - lat_w
         self._text(p, meta_end, r.top() + 50, "  ·  ".join(meta), C.dim, self.f_small, "right",
                    max_w=max(40.0, meta_end - chip.right() - 18))
-        scene = vlm.scene or vlm.text or ("Waiting for first scene description..." if vlm.enabled else "VLM disabled")
-        self._text(p, r.left() + 32, r.top() + 108, scene, C.red if vlm.unsafe else C.label, self.f_row,
-                   max_w=r.width() - 64)
+        dms_line = getattr(vlm, "dms_scene", "") or ""
+        cms_line = getattr(vlm, "cms_scene", "") or ""
+        dms_desc = getattr(vlm, "dms_description", "") or ""
+        cms_desc = getattr(vlm, "cms_description", "") or ""
+        scene_c = C.red if vlm.unsafe else C.label
+        line_w = r.width() - 64
+        if dms_line or cms_line:
+            scene = " · ".join(part for part in (f"DMS: {dms_line}" if dms_line else "", f"CMS: {cms_line}" if cms_line else "") if part)
+            self._text(p, r.left() + 32, r.top() + 100, scene, scene_c, self.f_row, max_w=line_w)
+            policy_y = r.top() + 148
+            if dms_desc or cms_desc:
+                self._text(p, r.left() + 32, r.top() + 138, f"DMS: {dms_desc or '—'}", C.dim, self.f_small, max_w=line_w)
+                self._text(p, r.left() + 32, r.top() + 168, f"CMS: {cms_desc or '—'}", C.dim, self.f_small, max_w=line_w)
+                policy_y = r.top() + 200
+        else:
+            scene = vlm.scene or vlm.text or ("Waiting for first scene description..." if vlm.enabled else "VLM disabled")
+            self._text(p, r.left() + 32, r.top() + 108, scene, scene_c, self.f_row, max_w=line_w)
+            policy_y = r.top() + 158
         if vlm.policy:
             policy, policy_c = vlm.policy, C.red if vlm.unsafe else C.amber if vlm.suppressed else C.dim
         elif vlm.enabled and not vlm.calls:
@@ -679,7 +694,7 @@ class Dashboard(QWidget):
         else:
             policy, policy_c = "", C.dim
         if policy:
-            self._text(p, r.left() + 32, r.top() + 158, policy, policy_c, self.f_small, max_w=r.width() - 64)
+            self._text(p, r.left() + 32, policy_y, policy, policy_c, self.f_small, max_w=line_w)
 
     # ------------------------------------------------------------------ right column
     def _analysis(self, p: QPainter, r: QRectF, ds) -> None:

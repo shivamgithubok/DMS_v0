@@ -24,15 +24,15 @@ realtime:
   landmarks: auto
   ear_threshold: 0.21
   ear_auto_calibrate: true
-  eyes_closed_s: 1.5
+  eyes_closed_s: 2.5
   yaw_threshold_deg: 30
-  head_turn_s: 2.0
-  phone_s: 1.0
+  head_turn_s: 3.0
+  phone_s: 2.0
   gaze_away_deg: 25
   object_detector_hz: 15
   mirror: false
   seatbelt_check: true
-  alert_cooldown_s: 8
+  alert_cooldown_s: 15
 
 vlm:
   enabled: true
@@ -40,8 +40,9 @@ vlm:
   model: auto
   interval_s: 2.5
   timeout_s: 20.0
-  max_tokens: 80
+  max_tokens: 220
   image_width: 448
+  confidence_min: 0.7
   thermal_limit_c: 85
   thermal_backoff: 3.0
   memory_limit_mb: 7500

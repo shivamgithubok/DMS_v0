@@ -65,6 +65,8 @@ def parse_args(argv=None):
     ap.add_argument("--no-vlm", action="store_true")
     ap.add_argument("--no-audio", action="store_true")
     ap.add_argument("--no-mqtt", action="store_true")
+    ap.add_argument("--webrtc", action="store_true", help="publish dummy/live video stills to the guardian API")
+    ap.add_argument("--no-webrtc", action="store_true")
     ap.add_argument("--duration", type=float, default=0.0, help="exit after N seconds (tests/benchmarks)")
     ap.add_argument("--snapshot", help="write a dashboard PNG at exit (with --duration)")
     ap.add_argument("--log-level")
@@ -72,7 +74,7 @@ def parse_args(argv=None):
 
 
 def build_overrides(args) -> dict:
-    o: dict = {"cameras": {"driver": {}, "passenger": {}}, "audio": {}, "vlm": {}, "mqtt": {}, "ui": {}}
+    o: dict = {"cameras": {"driver": {}, "passenger": {}}, "audio": {}, "vlm": {}, "mqtt": {}, "ui": {}, "webrtc": {}}
     if args.camera:
         o["cameras"]["driver"]["source"] = f"{args.camera}:0"
         o["cameras"]["passenger"]["source"] = f"{args.camera}:1"
@@ -100,6 +102,10 @@ def build_overrides(args) -> dict:
         o["audio"]["enabled"] = False
     if args.no_mqtt:
         o["mqtt"]["enabled"] = False
+    if args.webrtc:
+        o["webrtc"]["enabled"] = True
+    if args.no_webrtc:
+        o["webrtc"]["enabled"] = False
     if args.headless:
         o["ui"]["enabled"] = False
     if args.fullscreen:
@@ -155,6 +161,12 @@ class System:
             vlm = VlmWorker(cfg, self.capture, self.shared, self.bus)
             vlm.start()
             self.workers.append(vlm)
+        if cfg.webrtc.enabled:
+            from dms.webrtc_publisher import WebRtcPublisher
+
+            rtc = WebRtcPublisher(cfg, self.capture, self.shared)
+            rtc.start()
+            self.workers.append(rtc)
         if cfg.audio.enabled:
             from dms.audio_detector import AudioDetector
 

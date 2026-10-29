@@ -82,6 +82,11 @@ else
   pip install -r requirements-dev.txt
 fi
 
+# requirements.txt already pins this. Install it again so a .venv created before
+# that line still gets the SDK (`from livekit import rtc`).
+log "LiveKit SDK"
+pip install -c constraints.txt 'livekit>=0.17.6'
+
 if [[ ! -f config/dms.yaml ]]; then
   cp config/dms.example.yaml config/dms.yaml
   log "wrote config/dms.yaml from example — set mqtt.host (VPS IP) and camera sources"
