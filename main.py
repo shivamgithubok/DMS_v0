@@ -130,6 +130,7 @@ class System:
         self.workers: list = []
         self.audio = None
         self.mqtt = None
+        self.gps = None
 
     def start(self) -> None:
         from dms.cms import CabinMonitor
@@ -138,6 +139,20 @@ class System:
         cfg = self.cfg
         self.telemetry.start()
         self.shared.system = self.telemetry.stats
+        if cfg.gps.enabled:
+            from dms.gps import GpsFeed
+
+            gps = GpsFeed(cfg, self.shared)
+            gps._publish()
+            gps.start()
+            self.workers.append(gps)
+            self.gps = gps
+        if cfg.history.enabled:
+            from dms.history import TripHistory
+
+            history = TripHistory(cfg, self.shared, self.bus)
+            history.start()
+            self.workers.append(history)
         if cfg.mqtt.enabled:
             from dms.mqtt_publisher import MqttPublisher
 
@@ -161,12 +176,6 @@ class System:
             vlm = VlmWorker(cfg, self.capture, self.shared, self.bus)
             vlm.start()
             self.workers.append(vlm)
-        if cfg.webrtc.enabled:
-            from dms.webrtc_publisher import WebRtcPublisher
-
-            rtc = WebRtcPublisher(cfg, self.capture, self.shared)
-            rtc.start()
-            self.workers.append(rtc)
         if cfg.audio.enabled:
             from dms.audio_detector import AudioDetector
 
@@ -174,6 +183,18 @@ class System:
                 self.audio = AudioDetector(cfg, self.shared, self.bus).start()
             except Exception:
                 log.exception("audio pipeline failed to start; continuing without audio")
+        if cfg.webrtc.enabled:
+            from dms.webrtc_publisher import WebRtcPublisher
+
+            rtc = WebRtcPublisher(cfg, self.capture, self.shared, audio=self.audio)
+            rtc.start()
+            self.workers.append(rtc)
+        if cfg.webrtc.api_url:
+            from dms.clip_recorder import ClipRecorder
+
+            clips = ClipRecorder(cfg, self.capture, self.bus)
+            clips.start()
+            self.workers.append(clips)
         supervisor = threading.Thread(target=self._supervise, name="supervisor", daemon=True)
         supervisor.start()
         log.info("DMS %s running on %s as %s", __version__, self.shared.hardware, cfg.device_id)
@@ -200,6 +221,8 @@ class System:
             "cabin": {"occupants": self.shared.passenger.occupants,
                       "child_present": self.shared.passenger.child_present,
                       "connected": self.shared.passenger.connected},
+            "gps": self.shared.gps.payload(),
+            "lastTrip": (self.shared.history or {}).get("lastTrip"),
             "audio_backend": self.shared.audio.backend,
             "gpu_temp_c": None if sysd is None or sysd.gpu_temp_c is None else round(sysd.gpu_temp_c, 1),
             "mem_used_mb": None if sysd is None else round(sysd.mem_used_mb),

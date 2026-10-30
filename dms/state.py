@@ -183,6 +183,30 @@ class WebRtcState:
     seq: int = 0
     errors: int = 0
     last_error: str = ""
+    publishing: bool = False
+
+
+@dataclass
+class GpsState:
+    """Current vehicle position. ``fix`` is none, fixed (the configured point), or live."""
+
+    enabled: bool = False
+    available: bool = False
+    fix: str = "none"
+    source: str = "fixed"
+    lat: float | None = None
+    lon: float | None = None
+    at: int = 0  # epoch milliseconds
+
+    def payload(self) -> dict:
+        return {
+            "available": self.available,
+            "fix": self.fix,
+            "source": self.source,
+            "lat": None if self.lat is None else round(float(self.lat), 6),
+            "lon": None if self.lon is None else round(float(self.lon), 6),
+            "at": self.at or None,
+        }
 
 
 @dataclass
@@ -207,6 +231,8 @@ class SharedState:
         self.audio = AudioState()
         self.mqtt = MqttState()
         self.webrtc = WebRtcState()
+        self.gps = GpsState()
+        self.history = None  # latest trip list for Guardian; rows stay in history.sqlite3
         self.system = None  # telemetry.SystemStats
         self.hardware = ""
         self.device_id = ""

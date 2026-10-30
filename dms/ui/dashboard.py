@@ -102,6 +102,15 @@ def _font(size: float, weight: QFont.Weight = QFont.Weight.Medium, family: str =
     return font
 
 
+def _gps_label(gps) -> str:
+    if gps is None or not gps.enabled:
+        return "GPS off"
+    if not gps.available or gps.lat is None or gps.lon is None:
+        return "GPS unavailable"
+    kind = "live" if gps.fix == "live" else "fixed"
+    return f"GPS {kind} {gps.lat:.5f}, {gps.lon:.5f}"
+
+
 def to_qimage(bgr: np.ndarray) -> QImage:
     bgr = np.ascontiguousarray(bgr)
     h, w = bgr.shape[:2]
@@ -843,6 +852,7 @@ class Dashboard(QWidget):
             text = f"{state}   ·   sent {mq.acked}   ·   queued {mq.queued}   ·   {mq.success_rate:.1f}%"
         else:
             text = "MQTT uplink disabled"
+        text = f"{text}   ·   {_gps_label(getattr(self.shared, 'gps', None))}"
         self._text(p, r.left() + 56, r.top() + 72, text, C.label if mq.enabled else C.dim, self.f_small, max_w=r.width() - 80)
 
     # ------------------------------------------------------------------ modes

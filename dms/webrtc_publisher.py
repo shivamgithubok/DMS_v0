@@ -1,7 +1,12 @@
-"""Publish driver/cabin stills (dummy) or LiveKit tracks (when LIVEKIT_URL is wss).
+"""Publish driver/cabin stills, and a cabin video+audio stream when a guardian is watching.
 
-v1 dummy path: POST JPEG frames to the guardian API. Guardian fetches
-``GET /v1/rides/{id}/video/preview``. A real LiveKit SFU uses the same media-token.
+Stills: POST JPEG frames to the guardian API (preview tiles). Those always run.
+
+Stream: the media-token response includes ``publish``. When that is true and the
+mode is ``local``, one stitched cabin frame plus a PCM chunk is posted to
+``/video/live`` so the path can be tested without a LiveKit server. When the
+mode is ``livekit`` and the URL is ``ws``/``wss``, the same cabin picture and
+microphone audio are published as one WebRTC video track and one audio track.
 """
 
 from __future__ import annotations
@@ -22,6 +27,10 @@ from .state import WebRtcState
 
 log = logging.getLogger("dms.webrtc")
 
+CABIN_W = 640
+CABIN_H = 360
+AUDIO_RATE = 16000
+
 
 def dummy_frame(track: str, width: int = 320, height: int = 180, seq: int = 0) -> np.ndarray:
     """Synthetic BGR frame so video can be tested without cameras."""
@@ -41,12 +50,27 @@ def jpeg_b64(image: np.ndarray) -> str:
     return base64.b64encode(buf.tobytes()).decode()
 
 
+def stitch_cabin(driver: np.ndarray | None, passenger: np.ndarray | None, width: int = CABIN_W, height: int = CABIN_H) -> np.ndarray:
+    """One BGR video frame: driver on the left, passenger on the right."""
+    frames = [frame for frame in (driver, passenger) if frame is not None]
+    if not frames:
+        return dummy_frame("cabin", width, height)
+    tile_w = width // len(frames)
+    tiles = [cv2.resize(frame, (tile_w, height), interpolation=cv2.INTER_AREA) for frame in frames]
+    return np.hstack(tiles)
+
+
+def wants_stream(token: dict) -> bool:
+    return bool(token.get("publish")) and token.get("mode") in {"local", "livekit"}
+
+
 class WebRtcPublisher(threading.Thread):
-    def __init__(self, cfg, capture, shared) -> None:
+    def __init__(self, cfg, capture, shared, audio=None) -> None:
         super().__init__(name="webrtc-publisher", daemon=True)
         self.cfg = cfg.webrtc
         self.capture = capture
         self.shared = shared
+        self.audio = audio
         self.device_id = cfg.device_id
         self._halt = threading.Event()
         self.seq = 0
@@ -74,22 +98,41 @@ class WebRtcPublisher(threading.Thread):
         with urllib.request.urlopen(req, timeout=float(self.cfg.timeout_s)) as resp:
             return json.loads(resp.read().decode() or "{}")
 
-    def _frame_for(self, track: str) -> np.ndarray:
+    def _camera_image(self, track: str) -> np.ndarray:
         if self.cfg.dummy:
-            return dummy_frame(track, seq=self.seq)
+            return dummy_frame("driver" if track == "driver" else "cabin", seq=self.seq)
         grabber = self.capture.driver if track == "driver" else self.capture.passenger
         latest = grabber.latest() if grabber is not None else None
         if latest is None or getattr(latest, "image", None) is None:
-            return dummy_frame(track, seq=self.seq)
-        image = latest.image
+            return dummy_frame("driver" if track == "driver" else "cabin", seq=self.seq)
+        return latest.image
+
+    def _frame_for(self, track: str) -> np.ndarray:
+        image = self._camera_image("driver" if track == "driver" else "passenger")
         h, w = image.shape[:2]
         scale = min(1.0, 320 / max(w, 1))
         if scale < 1.0:
             image = cv2.resize(image, (int(w * scale), int(h * scale)))
         return image
 
+    def _cabin_frame(self) -> np.ndarray:
+        passenger = None if self.capture.passenger is None and not self.cfg.dummy else self._camera_image("passenger")
+        return stitch_cabin(self._camera_image("driver"), passenger)
+
+    def _pcm(self) -> tuple[bytes, int]:
+        n = min(AUDIO_RATE, max(320, int(AUDIO_RATE * float(self.cfg.interval_s))))
+        ring = None
+        if self.audio is not None:
+            ring = getattr(self.audio, "ring16", None) or getattr(self.audio, "ring", None)
+        if ring is None or getattr(ring, "total", 0) <= 0:
+            return np.zeros(n, dtype=np.int16).tobytes(), n
+        samples, _ = ring.latest(n)
+        pcm = np.clip(np.asarray(samples, dtype=np.float32), -1.0, 1.0)
+        out = (pcm * 32767.0).astype(np.int16)
+        return out.tobytes(), int(out.shape[0])
+
     def run(self) -> None:
-        self._publish_state(status="starting", api=self.cfg.api_url)
+        self._publish_state(status="starting", api=self.cfg.api_url, publishing=False)
         log.info("WebRTC publisher → %s", self.cfg.api_url)
         while not self._halt.is_set():
             try:
@@ -100,21 +143,32 @@ class WebRtcPublisher(threading.Thread):
                 self.last_token = token_body.get("token") or ""
                 url = str(token_body.get("url") or "")
                 mode = token_body.get("mode") or "dummy"
-                self._publish_state(status="online", mode=mode, room=token_body.get("room") or "", url=url)
-                if mode == "livekit" and url.startswith(("ws://", "wss://")):
+                streaming = wants_stream(token_body)
+                self._publish_state(
+                    status="online",
+                    mode=mode,
+                    room=token_body.get("room") or "",
+                    url=url,
+                    publishing=streaming,
+                )
+                if streaming and mode == "livekit" and url.startswith(("ws://", "wss://")):
                     try:
                         asyncio.run(self._livekit(token_body))
                     except Exception as exc:
                         self.errors += 1
-                        self._publish_state(status="error", last_error=str(exc))
+                        self._publish_state(status="error", last_error=str(exc), publishing=False)
                         log.warning("LiveKit publish failed: %s", exc)
                         self._halt.wait(float(self.cfg.interval_s))
                 else:
                     self._post_stills()
+                    if streaming and mode == "local":
+                        self._post_live()
+                    elif not streaming:
+                        self._publish_state(publishing=False)
                     self._halt.wait(float(self.cfg.interval_s))
             except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
                 self.errors += 1
-                self._publish_state(status="error", last_error=str(exc))
+                self._publish_state(status="error", last_error=str(exc), publishing=False)
                 log.warning("WebRTC publish failed: %s", exc)
                 self._halt.wait(float(self.cfg.interval_s))
 
@@ -127,36 +181,68 @@ class WebRtcPublisher(threading.Thread):
             )
         self.seq += 1
 
+    def _post_live(self) -> None:
+        pcm, samples = self._pcm()
+        frame = self._cabin_frame()
+        self._post(
+            f"/v1/devices/{self.device_id}/video/live",
+            {
+                "key": self.cfg.device_key,
+                "at": int(time.time() * 1000),
+                "width": int(frame.shape[1]),
+                "height": int(frame.shape[0]),
+                "samples": samples,
+                "rate": AUDIO_RATE,
+                "image_b64": jpeg_b64(frame),
+                "audio_b64": base64.b64encode(pcm).decode(),
+            },
+        )
+        self._publish_state(publishing=True, mode="local")
+
     async def _livekit(self, info: dict) -> None:
         from livekit import rtc
 
         room = rtc.Room()
         await room.connect(info["url"], info["token"])
         log.info("LiveKit connected room=%s", info.get("room"))
-        sources = {}
-        for name in ("driver", "cabin"):
-            source = rtc.VideoSource(320, 180)
-            track = rtc.LocalVideoTrack.create_video_track(name, source)
-            await room.local_participant.publish_track(
-                track, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_CAMERA)
-            )
-            sources[name] = source
+        source = rtc.VideoSource(CABIN_W, CABIN_H)
+        video = rtc.LocalVideoTrack.create_video_track("cabin", source)
+        await room.local_participant.publish_track(video, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_CAMERA))
+        audio_source = rtc.AudioSource(AUDIO_RATE, 1)
+        audio = rtc.LocalAudioTrack.create_audio_track("cabin", audio_source)
+        await room.local_participant.publish_track(audio, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE))
         started = time.monotonic()
         last_still = 0.0
+        last_token = started
         try:
             while not self._halt.is_set() and time.monotonic() - started < 1200:
-                for name, source in sources.items():
-                    rgb = cv2.cvtColor(self._frame_for(name), cv2.COLOR_BGR2RGB)
-                    rgb = cv2.resize(rgb, (320, 180))
-                    source.capture_frame(rtc.VideoFrame(320, 180, rtc.VideoBufferType.RGB24, rgb.tobytes()))
+                if time.monotonic() - last_token > 2.0:
+                    last_token = time.monotonic()
+                    try:
+                        fresh = await asyncio.to_thread(
+                            self._post,
+                            f"/v1/devices/{self.device_id}/media-token",
+                            {"key": self.cfg.device_key},
+                        )
+                    except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
+                        log.warning("token refresh failed: %s", exc)
+                    else:
+                        if not wants_stream(fresh):
+                            log.info("guardian stopped watching, leaving LiveKit")
+                            break
+                rgb = cv2.cvtColor(self._cabin_frame(), cv2.COLOR_BGR2RGB)
+                source.capture_frame(rtc.VideoFrame(CABIN_W, CABIN_H, rtc.VideoBufferType.RGB24, rgb.tobytes()))
+                pcm, samples = self._pcm()
+                await audio_source.capture_frame(rtc.AudioFrame(pcm, AUDIO_RATE, 1, samples))
                 self.seq += 1
-                self._publish_state(status="online", mode="livekit", room=info.get("room") or "", url=info.get("url") or "")
+                self._publish_state(status="online", mode="livekit", publishing=True, room=info.get("room") or "", url=info.get("url") or "")
                 if time.monotonic() - last_still > 2.0:
                     last_still = time.monotonic()
                     try:
-                        self._post_stills()
+                        await asyncio.to_thread(self._post_stills)
                     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
                         log.warning("still upload failed: %s", exc)
                 await asyncio.sleep(max(0.1, float(self.cfg.interval_s)))
         finally:
+            self._publish_state(publishing=False)
             await room.disconnect()

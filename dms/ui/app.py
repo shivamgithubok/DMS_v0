@@ -35,16 +35,17 @@ class StatePublisher(threading.Thread):
     def snapshot(self) -> dict:
         s = self.shared
         return {"driver": s.driver, "passenger": s.passenger, "vlm": s.vlm, "audio": s.audio, "mqtt": s.mqtt,
-                "system": s.system, "hardware": s.hardware, "device_id": s.device_id,
+                "gps": s.gps, "system": s.system, "hardware": s.hardware, "device_id": s.device_id,
                 "alerts": self.bus.recent(12)}
 
     def run(self) -> None:
         last_seq = None
         while not self._halt.wait(self.period):
             cabin = self.shared.passenger
+            gps = self.shared.gps
             seq = (self.shared.driver.seq, self.shared.vlm.calls, self.shared.audio.level_dbfs,
                    len(self.bus.history), self.shared.mqtt.acked, cabin.frame_ts, cabin.occupants,
-                   cabin.child_present, len(cabin.objects))
+                   cabin.child_present, len(cabin.objects), gps.fix, gps.lat, gps.lon)
             if seq == last_seq:
                 continue
             last_seq = seq
@@ -58,13 +59,14 @@ class _StateView:
     """UI side: same attributes the Dashboard reads from SharedState."""
 
     def __init__(self) -> None:
-        from ..state import AudioState, DriverState, MqttState, PassengerState, VlmState
+        from ..state import AudioState, DriverState, GpsState, MqttState, PassengerState, VlmState
 
         self.driver = DriverState()
         self.passenger = PassengerState()
         self.vlm = VlmState()
         self.audio = AudioState()
         self.mqtt = MqttState()
+        self.gps = GpsState()
         self.system = None
         self.hardware = ""
         self.device_id = ""

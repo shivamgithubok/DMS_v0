@@ -8,6 +8,7 @@ Topics
   dms/{device_id}/alert/vision   QoS 1
   dms/{device_id}/alert/audio    QoS 1
   dms/{device_id}/status         QoS 0 heartbeat every 30 s, retained; LWT "offline"
+  dms/{device_id}/trips          QoS 0 retained trip list; kept on the broker when the Jetson is off
   dms/{device_id}/analysis       QoS 0 retained latest driver VLM slice
   cms/{device_id}/alert          QoS 1   cabin alerts (child, object, aggression, occupancy)
   cms/{device_id}/status         QoS 0   retained cabin heartbeat
@@ -106,6 +107,7 @@ class MqttPublisher(threading.Thread):
         self.topic_vision = f"{prefix}/{self.device_id}/alert/vision"
         self.topic_audio = f"{prefix}/{self.device_id}/alert/audio"
         self.topic_status = f"{prefix}/{self.device_id}/status"
+        self.topic_trips = f"{prefix}/{self.device_id}/trips"
         cms_prefix = str(cfg.cms.topic_prefix).strip("/") or "cms"
         self.topic_cms = f"{cms_prefix}/{self.device_id}/alert"
         self.topic_cms_status = f"{cms_prefix}/{self.device_id}/status"
@@ -286,7 +288,17 @@ class MqttPublisher(threading.Thread):
                 topic = self.topic_audio
             else:
                 topic = self.topic_vision
-            self.outbox.put(topic, json.dumps(alert.payload(), separators=(",", ":")), int(self.cfg.alert_qos))
+            self.outbox.put(topic, json.dumps(self._with_gps(alert.payload()), separators=(",", ":")),
+                            int(self.cfg.alert_qos))
+
+    def _with_gps(self, payload: dict) -> dict:
+        gps = getattr(self.shared, "gps", None)
+        if gps is not None and gps.available and gps.lat is not None and gps.lon is not None:
+            payload["lat"] = round(float(gps.lat), 6)
+            payload["lon"] = round(float(gps.lon), 6)
+            payload["gps_fix"] = gps.fix
+            payload["gps_at"] = gps.at or None
+        return payload
 
     def _drain_analysis(self) -> None:
         while True:
@@ -353,6 +365,14 @@ class MqttPublisher(threading.Thread):
                             qos=int(self.cfg.heartbeat_qos), retain=True)
         cabin = status_body(self.device_id, self.shared.passenger, state, self.outbox.count())
         self.client.publish(self.topic_cms_status, json.dumps(cabin, separators=(",", ":")),
+                            qos=int(self.cfg.heartbeat_qos), retain=True)
+        self._send_trips()
+
+    def _send_trips(self) -> None:
+        body = getattr(self.shared, "history", None)
+        if not isinstance(body, dict) or not body.get("trips"):
+            return
+        self.client.publish(self.topic_trips, json.dumps(body, separators=(",", ":")),
                             qos=int(self.cfg.heartbeat_qos), retain=True)
 
     def _publish_state(self) -> None:

@@ -186,6 +186,27 @@ DEFAULTS: dict[str, Any] = {
         "interval_s": 0.2,
         "timeout_s": 5.0,
     },
+    # No receiver yet: source "fixed" publishes the single lat/lon below.
+    # Later, set source to "nmea" or "file" (device / file below). A live fix
+    # replaces that point; if the receiver goes quiet, the single point returns.
+    "gps": {
+        "enabled": True,
+        "source": "fixed",  # fixed | nmea | file
+        "lat": None,
+        "lon": None,
+        "interval_s": 1.0,
+        "stale_s": 15.0,
+        "device": "",  # serial port when source is nmea, e.g. /dev/ttyUSB0
+        "baud": 9600,
+        "file": "",  # JSON {"lat","lon"} when source is file, e.g. data/gps.json
+    },
+    # Kept trips for ride-1842. Separate from the MQTT outbox, which deletes rows.
+    "history": {
+        "enabled": True,
+        "ride_id": "ride-1842",
+        "db": "history.sqlite3",
+        "point_interval_s": 10,
+    },
     "ui": {
         "enabled": True,
         "fullscreen": False,
