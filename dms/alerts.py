@@ -127,6 +127,7 @@ class AlertBus:
         self.device_id = device_id
         self.cooldown_s = cooldown_s
         self.mqtt_queue: "queue.Queue[Alert]" = queue.Queue()
+        self.analysis_queue: "queue.Queue[tuple[str, dict]]" = queue.Queue()
         self._last: dict[tuple, float] = {}
         self._lock = threading.Lock()
         self._subscribers: list = []
@@ -136,6 +137,9 @@ class AlertBus:
 
     def subscribe(self, callback) -> None:
         self._subscribers.append(callback)
+
+    def emit_analysis(self, channel: str, body: dict) -> None:
+        self.analysis_queue.put((channel, body))
 
     def emit(self, alert: Alert, cooldown_s: float | None = None) -> bool:
         key = (alert.type, alert.reason)

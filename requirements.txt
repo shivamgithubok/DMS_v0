@@ -9,6 +9,7 @@ numpy==1.26.4
 opencv-contrib-python-headless==4.10.0.84   # cv2.face (LBF), ximgproc, FaceDetectorYN, FaceRecognizerSF
 PyYAML==6.0.2
 paho-mqtt==2.1.0
+livekit>=0.17.6
 sounddevice==0.5.1
 PySide6-Essentials==6.8.0.2                 # newest release with a glibc-2.31 aarch64 wheel (JP6 has 2.35)
 protobuf>=4.25.8,<5                         # satisfies both onnxruntime>=1.29 and mediapipe 0.10.18

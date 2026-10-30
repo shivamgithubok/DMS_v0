@@ -65,6 +65,8 @@ def parse_args(argv=None):
     ap.add_argument("--no-vlm", action="store_true")
     ap.add_argument("--no-audio", action="store_true")
     ap.add_argument("--no-mqtt", action="store_true")
+    ap.add_argument("--webrtc", action="store_true", help="publish dummy/live video stills to the guardian API")
+    ap.add_argument("--no-webrtc", action="store_true")
     ap.add_argument("--duration", type=float, default=0.0, help="exit after N seconds (tests/benchmarks)")
     ap.add_argument("--snapshot", help="write a dashboard PNG at exit (with --duration)")
     ap.add_argument("--log-level")
@@ -72,7 +74,7 @@ def parse_args(argv=None):
 
 
 def build_overrides(args) -> dict:
-    o: dict = {"cameras": {"driver": {}, "passenger": {}}, "audio": {}, "vlm": {}, "mqtt": {}, "ui": {}}
+    o: dict = {"cameras": {"driver": {}, "passenger": {}}, "audio": {}, "vlm": {}, "mqtt": {}, "ui": {}, "webrtc": {}}
     if args.camera:
         o["cameras"]["driver"]["source"] = f"{args.camera}:0"
         o["cameras"]["passenger"]["source"] = f"{args.camera}:1"
@@ -100,6 +102,10 @@ def build_overrides(args) -> dict:
         o["audio"]["enabled"] = False
     if args.no_mqtt:
         o["mqtt"]["enabled"] = False
+    if args.webrtc:
+        o["webrtc"]["enabled"] = True
+    if args.no_webrtc:
+        o["webrtc"]["enabled"] = False
     if args.headless:
         o["ui"]["enabled"] = False
     if args.fullscreen:
@@ -124,6 +130,7 @@ class System:
         self.workers: list = []
         self.audio = None
         self.mqtt = None
+        self.gps = None
 
     def start(self) -> None:
         from dms.cms import CabinMonitor
@@ -132,6 +139,20 @@ class System:
         cfg = self.cfg
         self.telemetry.start()
         self.shared.system = self.telemetry.stats
+        if cfg.gps.enabled:
+            from dms.gps import GpsFeed
+
+            gps = GpsFeed(cfg, self.shared)
+            gps._publish()
+            gps.start()
+            self.workers.append(gps)
+            self.gps = gps
+        if cfg.history.enabled:
+            from dms.history import TripHistory
+
+            history = TripHistory(cfg, self.shared, self.bus)
+            history.start()
+            self.workers.append(history)
         if cfg.mqtt.enabled:
             from dms.mqtt_publisher import MqttPublisher
 
@@ -162,6 +183,18 @@ class System:
                 self.audio = AudioDetector(cfg, self.shared, self.bus).start()
             except Exception:
                 log.exception("audio pipeline failed to start; continuing without audio")
+        if cfg.webrtc.enabled:
+            from dms.webrtc_publisher import WebRtcPublisher
+
+            rtc = WebRtcPublisher(cfg, self.capture, self.shared, audio=self.audio)
+            rtc.start()
+            self.workers.append(rtc)
+        if cfg.webrtc.api_url:
+            from dms.clip_recorder import ClipRecorder
+
+            clips = ClipRecorder(cfg, self.capture, self.bus)
+            clips.start()
+            self.workers.append(clips)
         supervisor = threading.Thread(target=self._supervise, name="supervisor", daemon=True)
         supervisor.start()
         log.info("DMS %s running on %s as %s", __version__, self.shared.hardware, cfg.device_id)
@@ -188,6 +221,8 @@ class System:
             "cabin": {"occupants": self.shared.passenger.occupants,
                       "child_present": self.shared.passenger.child_present,
                       "connected": self.shared.passenger.connected},
+            "gps": self.shared.gps.payload(),
+            "lastTrip": (self.shared.history or {}).get("lastTrip"),
             "audio_backend": self.shared.audio.backend,
             "gpu_temp_c": None if sysd is None or sysd.gpu_temp_c is None else round(sysd.gpu_temp_c, 1),
             "mem_used_mb": None if sysd is None else round(sysd.mem_used_mb),

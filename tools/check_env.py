@@ -15,7 +15,7 @@ from dms.bootstrap import ensure_venv  # noqa: E402
 
 ensure_venv()
 
-REQUIRED = ("numpy", "cv2", "yaml", "paho.mqtt.client", "sounddevice", "PySide6.QtWidgets", "onnxruntime")
+REQUIRED = ("numpy", "cv2", "yaml", "paho.mqtt.client", "livekit", "sounddevice", "PySide6.QtWidgets", "onnxruntime")
 OPTIONAL = ("tensorrt", "gi", "mediapipe", "vosk", "ai_edge_litert", "sense")
 
 
@@ -29,6 +29,7 @@ def main() -> int:
         except Exception as exc:
             missing.append(mod)
             hint = {"sounddevice": "  -> sudo apt install libportaudio2",
+                    "livekit": "  -> .venv/bin/pip install 'livekit>=0.17.6'",
                     "PySide6.QtWidgets": "  -> sudo apt install libxkbcommon-x11-0 libxcb-cursor0 libegl1"}.get(mod, "")
             print(f"  MISSING  {mod}: {exc}{hint}")
     for mod in OPTIONAL:

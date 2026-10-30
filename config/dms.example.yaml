@@ -24,15 +24,15 @@ realtime:
   landmarks: auto
   ear_threshold: 0.21
   ear_auto_calibrate: true
-  eyes_closed_s: 1.5
+  eyes_closed_s: 2.5
   yaw_threshold_deg: 30
-  head_turn_s: 2.0
-  phone_s: 1.0
+  head_turn_s: 3.0
+  phone_s: 2.0
   gaze_away_deg: 25
   object_detector_hz: 15
   mirror: false
   seatbelt_check: true
-  alert_cooldown_s: 8
+  alert_cooldown_s: 15
 
 vlm:
   enabled: true
@@ -40,8 +40,9 @@ vlm:
   model: auto
   interval_s: 2.5
   timeout_s: 20.0
-  max_tokens: 80
+  max_tokens: 220
   image_width: 448
+  confidence_min: 0.7
   thermal_limit_c: 85
   thermal_backoff: 3.0
   memory_limit_mb: 7500
@@ -60,6 +61,30 @@ audio:
     enabled: true
     model_dir: vosk-model-small-en-us-0.15
     keywords_file: config/abusive_keywords.txt
+
+# One position until a receiver is connected. Fill lat/lon and that point is
+# published on the heartbeat and on each alert. To use a real receiver later,
+# change source only:
+#   nmea + device: /dev/ttyUSB0 + baud
+#   file + file: data/gps.json   (JSON object with lat and lon)
+gps:
+  enabled: true
+  source: fixed
+  lat:
+  lon:
+  interval_s: 1
+  stale_s: 15
+  device: ""
+  baud: 9600
+  file: ""
+
+# Past trips for ride-1842. Stored in data/history.sqlite3 and kept after
+# shutdown. Published retained on dms/{device_id}/trips for the Guardian page.
+history:
+  enabled: true
+  ride_id: ride-1842
+  db: history.sqlite3
+  point_interval_s: 10
 
 mqtt:
   enabled: true

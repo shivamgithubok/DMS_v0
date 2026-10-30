@@ -8,8 +8,11 @@ Topics
   dms/{device_id}/alert/vision   QoS 1
   dms/{device_id}/alert/audio    QoS 1
   dms/{device_id}/status         QoS 0 heartbeat every 30 s, retained; LWT "offline"
+  dms/{device_id}/trips          QoS 0 retained trip list; kept on the broker when the Jetson is off
+  dms/{device_id}/analysis       QoS 0 retained latest driver VLM slice
   cms/{device_id}/alert          QoS 1   cabin alerts (child, object, aggression, occupancy)
   cms/{device_id}/status         QoS 0   retained cabin heartbeat
+  cms/{device_id}/analysis       QoS 0 retained latest cabin VLM slice
 
 Uses paho-mqtt 2.x with MQTT v5 (falls back to v3.1.1 if the broker refuses v5).
 """
@@ -104,9 +107,13 @@ class MqttPublisher(threading.Thread):
         self.topic_vision = f"{prefix}/{self.device_id}/alert/vision"
         self.topic_audio = f"{prefix}/{self.device_id}/alert/audio"
         self.topic_status = f"{prefix}/{self.device_id}/status"
+        self.topic_trips = f"{prefix}/{self.device_id}/trips"
         cms_prefix = str(cfg.cms.topic_prefix).strip("/") or "cms"
         self.topic_cms = f"{cms_prefix}/{self.device_id}/alert"
         self.topic_cms_status = f"{cms_prefix}/{self.device_id}/status"
+        self.topic_dms_analysis = f"{prefix}/{self.device_id}/analysis"
+        self.topic_cms_analysis = f"{cms_prefix}/{self.device_id}/analysis"
+        self._latest_analysis: dict[str, dict] = {}
         self.outbox = Outbox(data_path(self.cfg.outbox_db), int(self.cfg.outbox_max_rows))
         self._halt = threading.Event()
         self._wake = threading.Event()
@@ -166,6 +173,7 @@ class MqttPublisher(threading.Thread):
         self.outbox.reset_attempts()
         self._connected.set()
         self._send_status("online")
+        self._flush_analysis(force=True)
         self._wake.set()
 
     def _on_disconnect(self, client, userdata, flags, reason_code, properties) -> None:
@@ -205,6 +213,7 @@ class MqttPublisher(threading.Thread):
         try:
             while not self._halt.is_set():
                 self._drain_bus()
+                self._drain_analysis()
                 if self._connected.is_set():
                     self._flush()
                     if time.monotonic() - last_heartbeat >= float(self.cfg.heartbeat_s):
@@ -228,6 +237,7 @@ class MqttPublisher(threading.Thread):
                 self._wake.clear()
         finally:
             self._drain_bus()
+            self._drain_analysis()
             if self._connected.is_set():
                 self._flush()
                 deadline = time.monotonic() + 3.0
@@ -278,7 +288,39 @@ class MqttPublisher(threading.Thread):
                 topic = self.topic_audio
             else:
                 topic = self.topic_vision
-            self.outbox.put(topic, json.dumps(alert.payload(), separators=(",", ":")), int(self.cfg.alert_qos))
+            self.outbox.put(topic, json.dumps(self._with_gps(alert.payload()), separators=(",", ":")),
+                            int(self.cfg.alert_qos))
+
+    def _with_gps(self, payload: dict) -> dict:
+        gps = getattr(self.shared, "gps", None)
+        if gps is not None and gps.available and gps.lat is not None and gps.lon is not None:
+            payload["lat"] = round(float(gps.lat), 6)
+            payload["lon"] = round(float(gps.lon), 6)
+            payload["gps_fix"] = gps.fix
+            payload["gps_at"] = gps.at or None
+        return payload
+
+    def _drain_analysis(self) -> None:
+        while True:
+            try:
+                channel, body = self.bus.analysis_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._latest_analysis[channel] = body
+        self._flush_analysis()
+
+    def _flush_analysis(self, force: bool = False) -> None:
+        if not self._connected.is_set() and not force:
+            return
+        if not self._connected.is_set():
+            return
+        for channel, body in list(self._latest_analysis.items()):
+            topic = self.topic_cms_analysis if channel == "cms" else self.topic_dms_analysis
+            info = self.client.publish(topic, json.dumps(body, separators=(",", ":")), qos=0, retain=True)
+            if info.rc != mqtt.MQTT_ERR_SUCCESS:
+                self.last_error = f"analysis publish rc={info.rc}"
+                continue
+            self.published += 1
 
     def _flush(self) -> None:
         with self._lock:
@@ -323,6 +365,14 @@ class MqttPublisher(threading.Thread):
                             qos=int(self.cfg.heartbeat_qos), retain=True)
         cabin = status_body(self.device_id, self.shared.passenger, state, self.outbox.count())
         self.client.publish(self.topic_cms_status, json.dumps(cabin, separators=(",", ":")),
+                            qos=int(self.cfg.heartbeat_qos), retain=True)
+        self._send_trips()
+
+    def _send_trips(self) -> None:
+        body = getattr(self.shared, "history", None)
+        if not isinstance(body, dict) or not body.get("trips"):
+            return
+        self.client.publish(self.topic_trips, json.dumps(body, separators=(",", ":")),
                             qos=int(self.cfg.heartbeat_qos), retain=True)
 
     def _publish_state(self) -> None:

@@ -48,11 +48,11 @@ DEFAULTS: dict[str, Any] = {
         # Alert rules (spec): EAR < threshold for > 1.5 s, |yaw| > 30 deg for > 2 s.
         "ear_threshold": 0.21,
         "ear_auto_calibrate": True,  # per-driver baseline; threshold = min(ear_threshold, 0.72 * baseline)
-        "eyes_closed_s": 1.5,
+        "eyes_closed_s": 2.5,
         "yaw_threshold_deg": 30.0,
-        "head_turn_s": 2.0,
+        "head_turn_s": 3.0,
         "pitch_down_threshold_deg": 25.0,
-        "phone_s": 1.0,
+        "phone_s": 2.0,
         "phone_model_threshold": 0.50,
         "phone_detector_threshold": 0.35,
         "activity_threshold": 0.55,
@@ -63,8 +63,8 @@ DEFAULTS: dict[str, Any] = {
         "drowsy_s": 2.0,
         "seatbelt_check": True,
         "seatbelt_off_s": 10.0,
-        "no_face_s": 3.0,
-        "alert_cooldown_s": 8.0,
+        "no_face_s": 5.0,
+        "alert_cooldown_s": 15.0,
         "snapshot_alerts": True,
     },
     "passenger": {
@@ -95,25 +95,32 @@ DEFAULTS: dict[str, Any] = {
         "api_key": "",
         "interval_s": 2.5,  # 0.4 Hz, inside the 0.3-0.5 Hz window
         "timeout_s": 20.0,  # vision encode on the Orin often exceeds the old 3.5 s cap
-        "max_tokens": 120,
-        "temperature": 0.0,
+        "max_tokens": 320,
+        "temperature": 0.1,
         "image_width": 448,
         "jpeg_quality": 85,
         "composite": True,  # driver + passenger side by side in one image
-        "confidence_min": 0.55,  # JSON answers below this do not become alerts
+        "confidence_min": 0.7,  # JSON answers below this do not become alerts
+        "hold_cycles": 2,  # same CMS hazard must appear this many cycles in a row
         "prompt": (
-            "You analyse the cabin scene. Measurements from the driver monitor and cabin "
-            "monitor follow this instruction. Trust those measurements. Do not restate them "
-            "and do not contradict them. Describe only what they cannot measure: posture, "
-            "aggression, whether a child looks unattended, and whether something blocks the "
-            "driver's view. Reply with one JSON object and no other text: "
-            '{"scene":"one short sentence","hazards":[],"confidence":0.0}. '
-            "hazards may contain only passenger_aggressive, child_unattended, "
-            "objects_blocking_driver. Leave hazards empty when the scene adds nothing unsafe. "
-            "confidence is from 0 to 1."
+            "You analyse the cabin. Measurements follow this instruction; trust them and do "
+            "not contradict them. Reply with one JSON object and no other text: "
+            '{"dms":{"scene":"short","description":"","hazards":[],"confidence":0.0,'
+            '"observations":{"handsOnWheel":true,"gaze":"forward","viewBlocked":false,'
+            '"lighting":"ok","cameraBlocked":false}},'
+            '"cms":{"scene":"short","description":"","hazards":[],"confidence":0.0,'
+            '"observations":{"occupants":{"adults":0,"children":0},"childUnattended":false,'
+            '"aggression":"calm","viewBlocked":false,"weaponOrSmoke":false}}}. '
+            "Keep scene as the short label. description is one new sentence of what that person "
+            "is doing in this image: hands, gaze, phone, posture, or that the seat is empty. "
+            "Never leave description empty and never copy the word short into description. "
+            "dms.hazards must stay empty. cms.hazards may contain only passenger_aggressive, "
+            "child_unattended, objects_blocking_driver. aggression is calm, argument, or panic. "
+            "Leave cms.hazards empty when the cabin adds nothing unsafe. confidence is 0 to 1."
         ),
         "format_hint": (
-            "Left half of the image is the driver camera. Right half is the passenger camera."
+            "Left half of the image is the driver camera. Right half is the passenger camera. "
+            "Keep dms.scene and cms.scene short. Write what each person is doing in description."
         ),
         "thermal_limit_c": 85.0,
         "thermal_backoff": 3.0,  # interval multiplier while over the limit
@@ -170,6 +177,35 @@ DEFAULTS: dict[str, Any] = {
         "outbox_db": "outbox.sqlite3",
         "outbox_max_rows": 50000,
         "retry_after_s": 15.0,
+    },
+    "webrtc": {
+        "enabled": False,
+        "dummy": False,
+        "api_url": "http://127.0.0.1:8000",
+        "device_key": "dev-media-key",
+        "interval_s": 0.2,
+        "timeout_s": 5.0,
+    },
+    # No receiver yet: source "fixed" publishes the single lat/lon below.
+    # Later, set source to "nmea" or "file" (device / file below). A live fix
+    # replaces that point; if the receiver goes quiet, the single point returns.
+    "gps": {
+        "enabled": True,
+        "source": "fixed",  # fixed | nmea | file
+        "lat": None,
+        "lon": None,
+        "interval_s": 1.0,
+        "stale_s": 15.0,
+        "device": "",  # serial port when source is nmea, e.g. /dev/ttyUSB0
+        "baud": 9600,
+        "file": "",  # JSON {"lat","lon"} when source is file, e.g. data/gps.json
+    },
+    # Kept trips for ride-1842. Separate from the MQTT outbox, which deletes rows.
+    "history": {
+        "enabled": True,
+        "ride_id": "ride-1842",
+        "db": "history.sqlite3",
+        "point_interval_s": 10,
     },
     "ui": {
         "enabled": True,
@@ -266,4 +302,9 @@ def load_config(path: str | os.PathLike | None = None, overrides: dict | None = 
         "COCHL_PROJECT_KEY", merged["audio"]["cochl"]["project_key"]
     )
     merged["vlm"]["endpoint"] = os.environ.get("DMS_VLM_ENDPOINT", merged["vlm"]["endpoint"])
+    webrtc = merged["webrtc"]
+    webrtc["api_url"] = os.environ.get("DMS_WEBRTC_API_URL", webrtc["api_url"])
+    webrtc["device_key"] = os.environ.get("DMS_MEDIA_DEVICE_KEY", webrtc["device_key"]) or os.environ.get(
+        "MEDIA_DEVICE_KEY", webrtc["device_key"]
+    )
     return Config(merged)
