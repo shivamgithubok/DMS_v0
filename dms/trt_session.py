@@ -23,10 +23,12 @@ def import_tensorrt():
     try:
         import tensorrt as trt
     except ModuleNotFoundError:
-        for site in ("/usr/lib/python3.10/dist-packages", "/usr/lib/python3/dist-packages",
-                     "/usr/lib/python3.12/dist-packages"):
-            if Path(site).exists() and site not in sys.path:
-                sys.path.append(site)
+        sites = [Path("/usr/lib/python3/dist-packages")]
+        sites.extend(sorted(Path("/usr/lib").glob("python3.*/dist-packages")))
+        for site in sites:
+            text = str(site)
+            if site.is_dir() and text not in sys.path:
+                sys.path.append(text)
         import tensorrt as trt
     return trt
 

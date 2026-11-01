@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Native VLM server for the DMS (no Docker): llama.cpp `llama-server` built with CUDA for
-# Orin (sm_87), serving the GGUF + vision projector from models/vlm/ on 127.0.0.1:8080
-# with the OpenAI chat-completions API that dms/vlm_worker.py calls.
+# Native VLM server for the DMS (no Docker): llama.cpp `llama-server` built with CUDA
+# for this board's GPU, serving the GGUF + vision projector from models/vlm/ on
+# 127.0.0.1:8080 with the OpenAI chat-completions API that dms/vlm_worker.py calls.
+# CUDA_ARCH overrides the detected architecture (Orin 87, Xavier 72).
 #
 #   tools/vlm_server.sh               # build if needed, then run in the foreground
 #   tools/vlm_server.sh --build-only  # just build third_party/llama.cpp
@@ -35,14 +36,27 @@ build() {
     if [[ -x "$BIN" ]]; then echo "llama-server present: $BIN"; return; fi
   done
   [[ -d "$SRC/.git" ]] || git clone --depth 1 --branch "$REF" https://github.com/ggml-org/llama.cpp "$SRC"
-  local cuda=OFF arch=""
+  local cuda=OFF
+  local -a arch=()
   if command -v nvcc >/dev/null || [[ -x /usr/local/cuda/bin/nvcc ]]; then
     export PATH=/usr/local/cuda/bin:$PATH
-    cuda=ON; arch="-DCMAKE_CUDA_ARCHITECTURES=87"
+    cuda=ON
+    local sm="${CUDA_ARCH:-}"
+    if [[ -z "$sm" ]]; then
+      local model
+      model=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || true)
+      case "$model" in
+        *Orin*) sm=87 ;;
+        *Xavier*) sm=72 ;;
+        *) sm=native ;;
+      esac
+    fi
+    echo "llama.cpp CUDA arch: $sm"
+    arch=(-DCMAKE_CUDA_ARCHITECTURES="$sm")
   else
-    echo "nvcc not found: building CPU-only llama.cpp (too slow for 0.4 Hz on the Orin)"
+    echo "nvcc not found: building CPU-only llama.cpp (too slow for live VLM)"
   fi
-  cmake -S "$SRC" -B "$SRC/build" -DGGML_CUDA=$cuda $arch -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF \
+  cmake -S "$SRC" -B "$SRC/build" -DGGML_CUDA=$cuda "${arch[@]}" -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_EXAMPLES=OFF -DCMAKE_BUILD_TYPE=Release
   local jobs
   jobs=$(nproc)

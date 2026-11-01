@@ -112,8 +112,8 @@ Add:
 - **Room:** `ride-{rideId}` (example `ride-1842`). One active ride = one room.
 - **Publisher identity:** `camera-{deviceId}` (example `camera-orin-nano-01`).
 - **Viewer identity:** `viewer-{guardianId}` or `viewer-{rideId}-{random}`.
-- **Tracks:** `driver` (DMS camera), `cabin` (CMS camera). App picks which tile to show.
-- Encoder target v1: 640×360 @ 8–12 fps, ~400–800 kbps per track. Do not stream detector overlay at 15 FPS full HD over 4G.
+- **Live track:** `cabin`. For now that track is the driver camera only (640×360 @ 12 fps, ~800 kbps) plus the microphone, also named `cabin`. The passenger camera is not stitched into this picture.
+- JPEG `POST …/video/frame` is the idle preview while nobody is watching. Alert evidence is `POST …/clips` (JPEG frames plus one MP4). Neither of those is the watch stream.
 
 CSI: use existing GStreamer grab; encode JPEG/H.264 in the publisher. USB V4L2 from the CellularCam agent is **not** the Orin path.
 

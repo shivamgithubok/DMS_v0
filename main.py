@@ -191,10 +191,18 @@ class System:
             self.workers.append(rtc)
         if cfg.webrtc.api_url:
             from dms.clip_recorder import ClipRecorder
+            from dms.guardian_recorder import GuardianRecorder
+            from dms.talk_player import TalkPlayer
 
             clips = ClipRecorder(cfg, self.capture, self.bus)
             clips.start()
             self.workers.append(clips)
+            taken = GuardianRecorder(cfg, self.capture, audio=self.audio)
+            taken.start()
+            self.workers.append(taken)
+            voice = TalkPlayer(cfg)
+            voice.start()
+            self.workers.append(voice)
         supervisor = threading.Thread(target=self._supervise, name="supervisor", daemon=True)
         supervisor.start()
         log.info("DMS %s running on %s as %s", __version__, self.shared.hardware, cfg.device_id)

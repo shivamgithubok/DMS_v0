@@ -101,19 +101,18 @@ Left/right labels are from the driver's point of view, as in the reference: a no
 
 ```bash
 git clone <this repo> ~/orin-dms && cd ~/orin-dms
-./setup_jetson.sh --full        # apt packages, .venv, Python deps, all models, TRT engines, llama.cpp
-sudo nvpmodel -m 0              # 15 W profile
-python3 tools/enroll_driver.py --id 4827 --name "Emily Carter" --age 28 --camera csi:0
+./setup_jetson.sh --full        # apt, .venv, models, TensorRT engines, llama.cpp for this board
+python3 tools/enroll_driver.py --id 4827 --name "Emily Carter" --age 28 --camera auto:0
 ./run.sh                        # starts the VLM server (if downloaded) and the dashboard
 ```
 
-`./setup_jetson.sh` installs `requirements.txt` with `constraints.txt` (numpy 1.26 / protobuf 4.x, so mediapipe keeps working). It then installs `onnxruntime-gpu` from the Jetson AI Lab index (whatever version it carries for JP6/cu126), falling back to CPU `onnxruntime==1.23.2` from PyPI. Optional packages are installed one at a time, so a missing wheel never blocks the rest. Entry-point scripts switch into `.venv` by themselves, so a plain `python3 main.py` works.
+`./setup_jetson.sh` reads this board's L4T, CUDA, and Python (3.10 or newer). It does not assume JetPack 6 or a 15 W power mode. `nvpmodel` is left as the image set it; mode numbers differ by kit. Packages come from `requirements.txt` plus `constraints.txt` (numpy 1.26 / protobuf 4.x when those wheels exist). A pin with no wheel for this Python is retried looser, one package at a time. `onnxruntime-gpu` is taken from the Jetson AI Lab index that matches this JetPack and CUDA (`JETSON_PIP_INDEX` overrides it). If that index has no wheel, CPU ONNX Runtime is installed and the detectors still use TensorRT engines built here with `trtexec`. Entry-point scripts switch into `.venv` by themselves, so a plain `python3 main.py` works.
 
 Troubleshooting:
 - `python3 tools/check_env.py` lists required and optional modules, the ONNX Runtime providers, GStreamer access and models.
 - `.venv/bin/python -m dms.capture csi:0` opens one CSI camera for 5 s and prints the FPS and the capture path used.
 
-`./setup_jetson.sh` without `--full` installs only the required models and skips the VLM. The detector, audio and MQTT still run; start with `--no-vlm`.
+`./setup_jetson.sh` without `--full` still downloads the VLM. `--full` adds the optional landmark and audio models. If the VLM download or llama.cpp build fails, start with `--no-vlm`; the detector, audio, and MQTT still run.
 
 ### Cameras: CSI or USB
 
@@ -212,7 +211,7 @@ The figures below come from the development machine — a 2-vCPU x86 VM, CPU-onl
 
 ## Not yet exercised end to end
 
-- **Jetson-only paths.** CSI capture through `nvarguscamerasrc`, the native TensorRT engine runner, the ORT TensorRT provider and the Jetson sysfs telemetry are written for JetPack 6 but have not been run on hardware. The same is true of `setup_jetson.sh` and the llama.cpp CUDA build.
+- **Jetson-only paths.** CSI capture, TensorRT engines, and the llama.cpp CUDA build use whatever JetPack is on the board. Engines and GPU wheels are not portable across TensorRT or CUDA versions; `./setup_jetson.sh` rebuilds them. Missing optional packages are skipped.
 - **Optional back-ends.** The MediaPipe Face Mesh path, the YAMNet TFLite path and Vosk could not be tested because their model hosts were blocked on the build machine. The tested paths are LBF landmarks and the DSP audio classifier. The Cochl.Sense adapter follows the Edge SDK's documented Python API (`sense.session`, `create_stream_processor`, `ResultListener`), but tag names vary by project; map them in `audio.cochl.scream_tags`.
 - **The 8-head model** comes from the reference repository and its accuracy has not been re-validated here. On the reference frame it labels the emotion *Happy* and gives a weak *Cigarette* score (below the alert threshold).
 # DMS_v0
