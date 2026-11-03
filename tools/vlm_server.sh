@@ -94,6 +94,9 @@ MMPROJ=$(python3 -c "import json;print(json.load(open('$CFG'))['mmproj'])")
 echo "serving $MODEL (+ $MMPROJ) on 127.0.0.1:$PORT"
 # -ngl 99: all layers on the GPU; -np 1: one request at a time (0.4 Hz needs no batching);
 # --threads 2: leave the CPU cores to the real-time detector.
+# --cache-ram 0: do not keep past cabin pictures. The default cache is 8 GB and
+# each new frame was stored, so unified RAM climbed until the board was full.
 exec nice -n 10 "$BIN" -m "$ROOT/models/vlm/$MODEL" --mmproj "$ROOT/models/vlm/$MMPROJ" \
      --host 127.0.0.1 --port "$PORT" -ngl 99 -c "$CTX" -np 1 --threads 2 --alias vlm \
+     --cache-ram 0 --no-cache-idle-slots \
      --jinja --chat-template-kwargs '{"enable_thinking":false}'

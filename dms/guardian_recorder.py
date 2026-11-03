@@ -8,18 +8,18 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import shutil
 import subprocess
 import tempfile
 import threading
 import time
 import urllib.error
-import urllib.request
-import wave
 from pathlib import Path
 
 import cv2
 import numpy as np
 
+from .cloud_api import post_json
 from .webrtc_publisher import stitch_cabin
 
 log = logging.getLogger("dms.guardian_media")
@@ -28,35 +28,34 @@ AUDIO_RATE = 16000
 MAX_MS = 10 * 60 * 1000
 
 
-def encode_recording(frames: list[bytes], pcm: bytes, sample_rate: int = AUDIO_RATE) -> bytes:
-    """H.264 video plus AAC audio from the cabin microphone."""
-    if not frames:
+def encode_recording(root: Path, frames: int, sample_rate: int = AUDIO_RATE) -> bytes:
+    """H.264 video plus AAC audio from JPEGs and PCM already on disk.
+
+    The take is written as it is captured. Holding every JPEG and the whole
+    microphone buffer in RAM grew without a break for up to 10 minutes.
+    """
+    if frames <= 0:
         raise ValueError("recording needs frames")
-    with tempfile.TemporaryDirectory() as folder:
-        root = Path(folder)
-        for index, jpeg in enumerate(frames):
-            (root / f"{index:05d}.jpg").write_bytes(jpeg)
-        span_s = max(0.5, len(pcm) / 2 / sample_rate) if pcm else max(0.5, len(frames) / 2)
-        fps = max(1.0, min(8.0, (len(frames) - 1) / span_s)) if len(frames) > 1 else 2.0
-        out = root / "clip.mp4"
-        cmd = [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-framerate", f"{fps:.3f}",
-            "-i", str(root / "%05d.jpg"),
-        ]
-        if pcm:
-            wav_path = root / "cabin.wav"
-            with wave.open(str(wav_path), "wb") as handle:
-                handle.setnchannels(1)
-                handle.setsampwidth(2)
-                handle.setframerate(sample_rate)
-                handle.writeframes(pcm)
-            cmd.extend(["-i", str(wav_path), "-c:a", "aac", "-shortest"])
-        cmd.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out)])
-        proc = subprocess.run(cmd, capture_output=True)
-        if proc.returncode != 0 or not out.is_file():
-            raise RuntimeError(proc.stderr.decode("utf-8", "replace")[:300] or "ffmpeg failed")
-        return out.read_bytes()
+    pcm_path = root / "cabin.pcm"
+    pcm_size = pcm_path.stat().st_size if pcm_path.is_file() else 0
+    span_s = max(0.5, pcm_size / 2 / sample_rate) if pcm_size else max(0.5, frames / 2)
+    fps = max(1.0, min(8.0, (frames - 1) / span_s)) if frames > 1 else 2.0
+    out = root / "clip.mp4"
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-framerate", f"{fps:.3f}",
+        "-i", str(root / "%05d.jpg"),
+    ]
+    if pcm_size:
+        cmd.extend([
+            "-f", "s16le", "-ar", str(sample_rate), "-ac", "1", "-i", str(pcm_path),
+            "-c:a", "aac", "-shortest",
+        ])
+    cmd.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out)])
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0 or not out.is_file():
+        raise RuntimeError(proc.stderr.decode("utf-8", "replace")[:300] or "ffmpeg failed")
+    return out.read_bytes()
 
 
 class GuardianRecorder(threading.Thread):
@@ -70,22 +69,15 @@ class GuardianRecorder(threading.Thread):
         self._halt = threading.Event()
         self._rec_id = ""
         self._started_at = 0
-        self._frames: list[bytes] = []
-        self._pcm = bytearray()
+        self._root: Path | None = None
+        self._pcm_fh = None
+        self._count = 0
 
     def stop(self) -> None:
         self._halt.set()
 
     def _post(self, path: str, body: dict) -> dict:
-        url = self.cfg.api_url.rstrip("/") + path
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=float(self.cfg.timeout_s)) as resp:
-            return json.loads(resp.read().decode() or "{}")
+        return post_json(self.cfg.api_url.rstrip("/") + path, body, float(self.cfg.timeout_s))
 
     def _cabin_jpeg(self) -> bytes | None:
         def image(track: str):
@@ -108,57 +100,87 @@ class GuardianRecorder(threading.Thread):
         pcm = np.clip(np.asarray(samples, dtype=np.float32), -1.0, 1.0)
         return (pcm * 32767.0).astype(np.int16).tobytes()
 
+    def _open_take(self, rec_id: str) -> None:
+        self._discard()
+        self._rec_id = rec_id
+        self._started_at = int(time.time() * 1000)
+        self._root = Path(tempfile.mkdtemp(prefix="guardian-rec-"))
+        self._pcm_fh = open(self._root / "cabin.pcm", "wb")
+        self._count = 0
+
+    def _discard(self) -> None:
+        if self._pcm_fh is not None:
+            self._pcm_fh.close()
+            self._pcm_fh = None
+        root = self._root
+        self._root = None
+        self._count = 0
+        self._rec_id = ""
+        self._started_at = 0
+        if root is not None:
+            shutil.rmtree(root, ignore_errors=True)
+
     def _sample(self) -> None:
+        if self._root is None or self._pcm_fh is None:
+            return
         jpeg = self._cabin_jpeg()
         if jpeg:
-            self._frames.append(jpeg)
-        self._pcm.extend(self._pcm_chunk())
+            (self._root / f"{self._count:05d}.jpg").write_bytes(jpeg)
+            self._count += 1
+        self._pcm_fh.write(self._pcm_chunk())
 
     def _finish(self) -> None:
-        rec_id, frames, pcm = self._rec_id, self._frames, bytes(self._pcm)
+        if self._pcm_fh is not None:
+            self._pcm_fh.close()
+            self._pcm_fh = None
+        rec_id, root, frames = self._rec_id, self._root, self._count
         self._rec_id = ""
-        self._frames = []
-        self._pcm = bytearray()
+        self._root = None
+        self._count = 0
         self._started_at = 0
-        if not rec_id or not frames:
+        if not rec_id or root is None or frames <= 0:
+            if root is not None:
+                shutil.rmtree(root, ignore_errors=True)
             return
         try:
-            video = encode_recording(frames, pcm)
-        except (OSError, RuntimeError, ValueError) as exc:
-            log.warning("guardian recording encode failed for %s: %s", rec_id, exc)
-            return
-        try:
+            video = encode_recording(root, frames)
             self._post(
                 f"/v1/devices/{self.device_id}/recordings/{rec_id}",
                 {"key": self.cfg.device_key, "video_b64": base64.b64encode(video).decode()},
             )
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
+        except (urllib.error.URLError, TimeoutError, OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
             log.warning("guardian recording upload failed for %s: %s", rec_id, exc)
             return
-        log.info("guardian recording %s uploaded (%d frames, audio %d bytes)", rec_id, len(frames), len(pcm))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+        log.info("guardian recording %s uploaded (%d frames)", rec_id, frames)
 
     def run(self) -> None:
         log.info("guardian recorder → %s", self.cfg.api_url)
-        while not self._halt.is_set():
-            try:
-                token = self._post(f"/v1/devices/{self.device_id}/media-token", {"key": self.cfg.device_key})
-                current = token.get("recording") or None
-                rec_id = str(current.get("id") or "") if isinstance(current, dict) else ""
-                if rec_id and rec_id != self._rec_id:
-                    if self._rec_id:
+        try:
+            while not self._halt.is_set():
+                try:
+                    token = self._post(f"/v1/devices/{self.device_id}/media-token", {"key": self.cfg.device_key})
+                    current = token.get("recording") or None
+                    rec_id = str(current.get("id") or "") if isinstance(current, dict) else ""
+                    if rec_id and rec_id != self._rec_id:
+                        if self._rec_id:
+                            self._finish()
+                        self._open_take(rec_id)
+                        log.info("guardian recording started %s", rec_id)
+                    if self._rec_id and not rec_id:
                         self._finish()
-                    self._rec_id = rec_id
-                    self._started_at = int(time.time() * 1000)
-                    log.info("guardian recording started %s", rec_id)
-                if self._rec_id and not rec_id:
-                    self._finish()
-                elif self._rec_id:
-                    self._sample()
-                    if int(time.time() * 1000) - self._started_at >= MAX_MS:
-                        log.info("guardian recording %s reached 10 minutes", self._rec_id)
-                        self._finish()
-            except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
-                log.warning("guardian recorder poll failed: %s", exc)
-            except Exception:
-                log.exception("guardian recorder failed")
-            self._halt.wait(self.sample_s)
+                    elif self._rec_id:
+                        self._sample()
+                        if int(time.time() * 1000) - self._started_at >= MAX_MS:
+                            log.info("guardian recording %s reached 10 minutes", self._rec_id)
+                            self._finish()
+                except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
+                    log.warning("guardian recorder poll failed: %s", exc)
+                    self._halt.wait(max(2.0, self.sample_s))
+                    continue
+                except Exception:
+                    log.exception("guardian recorder failed")
+                self._halt.wait(self.sample_s)
+        finally:
+            self._discard()

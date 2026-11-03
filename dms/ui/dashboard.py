@@ -392,15 +392,16 @@ class Dashboard(QWidget):
         path = QPainterPath()
         path.addRoundedRect(rect, 6, 6)
         p.setClipPath(path)
-        img = self._qimage("driver", ds.frame, ds.seq)
-        if img is None:
+        frame = ds.frame
+        if frame is None:
             p.fillRect(rect, QColor("#05090d"))
             self._text(p, rect.center().x(), rect.center().y(), "Waiting for driver camera...", C.dim, self.f_alert, "center")
             p.restore()
             self._frame_border(p, rect)
             return
+        fh, fw = frame.shape[:2]
         scale, ox, oy, m = self._video_transform(rect, ds)
-        target = QRectF(rect.left() - ox, rect.top() - oy, img.width() * scale, img.height() * scale)
+        target = QRectF(rect.left() - ox, rect.top() - oy, fw * scale, fh * scale)
         dev = p.worldTransform().m11()
         dw, dh = max(1, int(target.width() * dev)), max(1, int(target.height() * dev))
         cached = self._frame_cache.get("driver_scaled")

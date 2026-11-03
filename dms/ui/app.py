@@ -14,6 +14,7 @@ import queue
 import signal
 import threading
 import time
+from dataclasses import replace
 
 log = logging.getLogger("dms.ui")
 
@@ -28,13 +29,35 @@ class StatePublisher(threading.Thread):
         self.queue = out_queue
         self.period = 1.0 / max(1.0, float(fps))
         self._halt = threading.Event()
+        self._cabin_ts = None
+        self._photo_key = None
 
     def stop(self) -> None:
         self._halt.set()
 
     def snapshot(self) -> dict:
+        """Newest state for the dashboard.
+
+        The cabin picture and the enrollment photo change much slower than the driver
+        frame. Sending them on every driver frame pickled a multi-megabyte copy about
+        20 times a second, and that heap was never given back.
+        """
         s = self.shared
-        return {"driver": s.driver, "passenger": s.passenger, "vlm": s.vlm, "audio": s.audio, "mqtt": s.mqtt,
+        driver = s.driver
+        ident = driver.identity
+        photo_key = (ident.known, ident.driver_id, ident.photo is not None)
+        if photo_key == self._photo_key:
+            ident = replace(ident, photo=None)
+        else:
+            self._photo_key = photo_key
+        # Landmarks are only an input to the mesh. The dashboard draws mesh_points.
+        driver = replace(driver, identity=ident, landmarks=None)
+        cabin = s.passenger
+        if cabin.frame is not None and cabin.frame_ts == self._cabin_ts:
+            cabin = replace(cabin, frame=None)
+        else:
+            self._cabin_ts = cabin.frame_ts
+        return {"driver": driver, "passenger": cabin, "vlm": s.vlm, "audio": s.audio, "mqtt": s.mqtt,
                 "gps": s.gps, "system": s.system, "hardware": s.hardware, "device_id": s.device_id,
                 "alerts": self.bus.recent(12)}
 
@@ -73,8 +96,17 @@ class _StateView:
         self.alerts: list = []
 
     def apply(self, snap: dict) -> None:
+        prev_ident = self.driver.identity
+        prev_cabin_frame = self.passenger.frame
+        prev_cabin_ts = self.passenger.frame_ts
         for key, value in snap.items():
             setattr(self, key, value)
+        ident = self.driver.identity
+        if ident.photo is None and prev_ident.driver_id == ident.driver_id and prev_ident.known == ident.known:
+            ident.photo = prev_ident.photo
+        cabin = self.passenger
+        if cabin.frame is None and cabin.frame_ts == prev_cabin_ts:
+            cabin.frame = prev_cabin_frame
 
 
 class _BusView:
@@ -91,9 +123,12 @@ class _BusView:
         return None
 
 
-def run_ui(in_queue, stop_event, fps: int, fullscreen: bool, snapshot: str | None, log_level: str) -> int:
+def run_ui(in_queue, stop_event, fps: int, fullscreen: bool, snapshot: str | None,
+           log_level: str, log_path: str | None = None) -> int:
     """Entry point of the HMI process."""
-    logging.basicConfig(level=log_level, format="%(asctime)s %(levelname).1s ui: %(message)s", datefmt="%H:%M:%S")
+    from dms.logutil import configure_logging
+
+    configure_logging(log_level, log_path or None)
     signal.signal(signal.SIGINT, signal.SIG_IGN)  # the core owns shutdown
     from PySide6.QtCore import QTimer
     from PySide6.QtWidgets import QApplication
@@ -136,9 +171,11 @@ def start_ui_process(cfg, shared, bus, snapshot: str | None = None):
     q = ctx.Queue(maxsize=1)
     q.cancel_join_thread()  # never block core shutdown on a UI that has gone away
     stop_event = ctx.Event()
+    from dms.logutil import log_file
+
     proc = ctx.Process(target=run_ui, name="dms-dashboard",
                        args=(q, stop_event, int(cfg.ui.fps), bool(cfg.ui.fullscreen), snapshot,
-                             str(cfg.log_level).upper()))
+                             str(cfg.log_level).upper(), str(log_file(cfg, ui=True))))
     proc.start()
     publisher = StatePublisher(shared, bus, q, cfg.ui.fps)
     publisher.start()

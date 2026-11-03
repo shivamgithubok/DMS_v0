@@ -1,11 +1,8 @@
 """Publish a live cabin video+audio stream when a guardian is watching.
 
-The watch picture is a LiveKit video track, encoded by the WebRTC stack from
-the driver camera. It is not a series of JPEG uploads. JPEG stills are only
-the idle preview on ``/video/frame``, and they stop while the live track is up
-so the phone does not keep showing snapshots.
-
-The track stays named ``cabin``. For now it carries the driver camera only.
+Live pictures are two LiveKit video tracks, ``driver`` and ``cabin``. JPEG
+stills on ``/video/frame`` are the idle preview: driver and passenger, one
+pair every 2 seconds. Those stills stop while the live tracks are publishing.
 """
 
 from __future__ import annotations
@@ -17,11 +14,11 @@ import logging
 import threading
 import time
 import urllib.error
-import urllib.request
 
 import cv2
 import numpy as np
 
+from .cloud_api import post_json
 from .state import WebRtcState
 
 log = logging.getLogger("dms.webrtc")
@@ -31,6 +28,8 @@ CABIN_H = 360
 AUDIO_RATE = 16000
 STREAM_FPS = 12
 STREAM_BITRATE = 800_000
+# Idle preview on /video/frame. One driver still and one passenger still, then wait.
+STILL_INTERVAL_S = 2.0
 
 
 def dummy_frame(track: str, width: int = 320, height: int = 180, seq: int = 0) -> np.ndarray:
@@ -109,16 +108,9 @@ class WebRtcPublisher(threading.Thread):
         values.update(enabled=True, seq=self.seq, errors=self.errors)
         self.shared.webrtc = WebRtcState(**values)
 
-    def _post(self, path: str, body: dict) -> dict:
+    def _post(self, path: str, body: dict, timeout: float | None = None) -> dict:
         url = self.cfg.api_url.rstrip("/") + path
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=float(self.cfg.timeout_s)) as resp:
-            return json.loads(resp.read().decode() or "{}")
+        return post_json(url, body, float(self.cfg.timeout_s if timeout is None else timeout))
 
     def _camera_image(self, track: str) -> np.ndarray:
         if self.cfg.dummy:
@@ -137,9 +129,9 @@ class WebRtcPublisher(threading.Thread):
             image = cv2.resize(image, (int(w * scale), int(h * scale)))
         return image
 
-    def _cabin_frame(self) -> np.ndarray:
-        """Driver camera only, fitted to the cabin track size."""
-        return fit_cover(self._camera_image("driver"), CABIN_W, CABIN_H)
+    def _track_frame(self, track: str) -> np.ndarray:
+        """One camera, fitted to the LiveKit track size. ``cabin`` is the passenger source."""
+        return fit_cover(self._camera_image(track), CABIN_W, CABIN_H)
 
     def _pcm(self, samples: int | None = None) -> tuple[bytes, int]:
         n = samples if samples is not None else min(AUDIO_RATE, max(320, int(AUDIO_RATE * float(self.cfg.interval_s))))
@@ -188,12 +180,12 @@ class WebRtcPublisher(threading.Thread):
                         self._post_live()
                     elif not streaming:
                         self._publish_state(publishing=False)
-                    self._halt.wait(float(self.cfg.interval_s))
+                    self._halt.wait(STILL_INTERVAL_S)
             except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
                 self.errors += 1
                 self._publish_state(status="error", last_error=str(exc), publishing=False)
                 log.warning("WebRTC publish failed: %s", exc)
-                self._halt.wait(float(self.cfg.interval_s))
+                self._halt.wait(max(2.0, float(self.cfg.interval_s)))
 
     def _post_stills_safe(self) -> None:
         try:
@@ -202,17 +194,24 @@ class WebRtcPublisher(threading.Thread):
             log.warning("live still failed: %s", exc)
 
     def _post_stills(self) -> None:
+        """Driver (DMS) and passenger stills for the preview. Not a video stream."""
         now = int(time.time() * 1000)
+        failed = []
         for track in ("driver", "cabin"):
-            self._post(
-                f"/v1/devices/{self.device_id}/video/frame",
-                {"key": self.cfg.device_key, "track": track, "at": now, "image_b64": jpeg_b64(self._frame_for(track))},
-            )
+            try:
+                self._post(
+                    f"/v1/devices/{self.device_id}/video/frame",
+                    {"key": self.cfg.device_key, "track": track, "at": now, "image_b64": jpeg_b64(self._frame_for(track))},
+                )
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
+                failed.append(f"{track}: {exc}")
         self.seq += 1
+        if failed:
+            raise OSError("frame " + "; ".join(failed))
 
     def _post_live(self) -> None:
         pcm, samples = self._pcm()
-        frame = self._cabin_frame()
+        frame = self._track_frame("driver")
         self._post(
             f"/v1/devices/{self.device_id}/video/live",
             {
@@ -272,8 +271,7 @@ class WebRtcPublisher(threading.Thread):
         return opts
 
     async def _session_sidework(self, stopped: asyncio.Event) -> None:
-        """Refresh the publisher token and keep the live JPEG updating."""
-        last_still = 0.0
+        """Refresh the publisher token. JPEG stills stay off while the tracks are live."""
         while not self._halt.is_set() and not stopped.is_set():
             try:
                 fresh = await asyncio.to_thread(
@@ -288,12 +286,8 @@ class WebRtcPublisher(threading.Thread):
                     log.info("guardian stopped watching, leaving LiveKit")
                     stopped.set()
                     return
-            now = time.monotonic()
-            if now - last_still >= 2.0:
-                last_still = now
-                await asyncio.to_thread(self._post_stills_safe)
             try:
-                await asyncio.wait_for(stopped.wait(), timeout=2.0)
+                await asyncio.wait_for(stopped.wait(), timeout=10.0)
                 return
             except asyncio.TimeoutError:
                 continue
@@ -306,10 +300,13 @@ class WebRtcPublisher(threading.Thread):
         side = None
         try:
             await room.connect(info["url"], info["token"])
-            log.info("LiveKit video room=%s %dx%d @ %dfps", info.get("room"), CABIN_W, CABIN_H, STREAM_FPS)
-            source = rtc.VideoSource(CABIN_W, CABIN_H)
-            video = rtc.LocalVideoTrack.create_video_track("cabin", source)
-            await room.local_participant.publish_track(video, self._camera_publish_options(rtc))
+            log.info("LiveKit video room=%s driver+cabin %dx%d @ %dfps", info.get("room"), CABIN_W, CABIN_H, STREAM_FPS)
+            sources = {}
+            for name in ("driver", "cabin"):
+                source = rtc.VideoSource(CABIN_W, CABIN_H)
+                video = rtc.LocalVideoTrack.create_video_track(name, source)
+                await room.local_participant.publish_track(video, self._camera_publish_options(rtc))
+                sources[name] = source
             audio_source = rtc.AudioSource(AUDIO_RATE, 1)
             audio = rtc.LocalAudioTrack.create_audio_track("cabin", audio_source)
             await room.local_participant.publish_track(audio, rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE))
@@ -320,9 +317,11 @@ class WebRtcPublisher(threading.Thread):
             samples_per = max(1, AUDIO_RATE // STREAM_FPS)
             index = 0
             while not self._halt.is_set() and not stopped.is_set() and time.monotonic() - started < 1200:
-                i420 = cv2.cvtColor(self._cabin_frame(), cv2.COLOR_BGR2YUV_I420)
-                frame = rtc.VideoFrame(CABIN_W, CABIN_H, rtc.VideoBufferType.I420, i420.tobytes())
-                self._push_video(source, frame, time.time_ns() // 1000)
+                stamp = time.time_ns() // 1000
+                for name, source in sources.items():
+                    i420 = cv2.cvtColor(self._track_frame(name), cv2.COLOR_BGR2YUV_I420)
+                    frame = rtc.VideoFrame(CABIN_W, CABIN_H, rtc.VideoBufferType.I420, i420.tobytes())
+                    self._push_video(source, frame, stamp)
                 pcm, samples = self._pcm(samples_per)
                 await audio_source.capture_frame(rtc.AudioFrame(pcm, AUDIO_RATE, 1, samples))
                 self.seq += 1

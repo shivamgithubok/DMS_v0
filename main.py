@@ -20,6 +20,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import logging
 import os
@@ -40,6 +41,7 @@ from dms import __version__  # noqa: E402
 from dms.alerts import AlertBus  # noqa: E402
 from dms.capture import CaptureService  # noqa: E402
 from dms.config import data_path, load_config  # noqa: E402
+from dms.logutil import configure_logging, log_file  # noqa: E402
 from dms.state import SharedState  # noqa: E402
 from dms.telemetry import Telemetry, hardware_label  # noqa: E402
 
@@ -258,10 +260,19 @@ class System:
                 last_log = now
                 ds = self.shared.driver
                 temp = stats.max_temp_c
-                log.info("fps=%.1f model=%.1fms pipeline=%.1fms temp=%s mem=%.0fMB vlm=%s/%d audio=%s mqtt=%s q=%d",
+                if now - getattr(self, "_trimmed", 0.0) >= 30.0:
+                    self._trimmed = now
+                    try:
+                        ctypes.CDLL("libc.so.6").malloc_trim(0)
+                    except OSError:
+                        pass
+                log.info("fps=%.1f model=%.1fms pipeline=%.1fms temp=%s mem=%.0fMB rss=%.0fMB vlm=%s/%d audio=%s mqtt=%s q=%d",
                          ds.fps, ds.model_ms, ds.pipeline_ms, "n/a" if temp is None else f"{temp:.0f}C",
-                         stats.mem_used_mb, self.shared.vlm.status, self.shared.vlm.calls, self.shared.audio.backend,
-                         "up" if self.shared.mqtt.connected else "down", self.shared.mqtt.queued)
+                         stats.mem_used_mb, stats.process_rss_mb, self.shared.vlm.status, self.shared.vlm.calls,
+                         self.shared.audio.backend, "up" if self.shared.mqtt.connected else "down", self.shared.mqtt.queued)
+                for label, cam in (("driver", self.capture.driver), ("passenger", self.capture.passenger)):
+                    if cam is not None and cam.stats.error:
+                        log.warning("camera %s: %s", label, cam.stats.error[:300])
                 if stats.mem_used_mb > limit:
                     log.warning("unified memory %.0f MB above the %d MB budget", stats.mem_used_mb, limit)
 
@@ -309,8 +320,7 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     cfg_path = args.config if (ROOT / args.config).exists() or Path(args.config).exists() else None
     cfg = load_config(cfg_path, build_overrides(args))
-    logging.basicConfig(level=getattr(logging, str(cfg.log_level).upper(), logging.INFO),
-                        format="%(asctime)s %(levelname).1s %(name)s: %(message)s", datefmt="%H:%M:%S")
+    configure_logging(cfg.log_level, log_file(cfg))
     system = System(cfg)
     system.start()
 

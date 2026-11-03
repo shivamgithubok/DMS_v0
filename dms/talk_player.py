@@ -9,7 +9,8 @@ import shutil
 import subprocess
 import threading
 import urllib.error
-import urllib.request
+
+from .cloud_api import post_json
 
 log = logging.getLogger("dms.talk")
 
@@ -87,15 +88,7 @@ class TalkPlayer(threading.Thread):
         self._halt.set()
 
     def _post(self, path: str, body: dict) -> dict:
-        url = self.cfg.api_url.rstrip("/") + path
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=float(self.cfg.timeout_s)) as resp:
-            return json.loads(resp.read().decode() or "{}")
+        return post_json(self.cfg.api_url.rstrip("/") + path, body, float(self.cfg.timeout_s))
 
     def _token(self) -> dict:
         return self._post(f"/v1/devices/{self.device_id}/media-token", {"key": self.cfg.device_key})
@@ -153,6 +146,8 @@ class TalkPlayer(threading.Thread):
                     asyncio.run(self._session(token))
             except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
                 log.warning("talk poll failed: %s", exc)
+                self._halt.wait(2.0)
+                continue
             except Exception:
                 log.exception("talk player failed")
             self._halt.wait(1.0)

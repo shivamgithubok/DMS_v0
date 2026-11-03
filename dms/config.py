@@ -21,6 +21,7 @@ DEFAULTS: dict[str, Any] = {
     "data_dir": "data",
     "models_dir": "models",
     "log_level": "INFO",
+    "log_file": "logs/dms.log",  # under data_dir; the dashboard writes dms-ui.log beside it
     "cameras": {
         # Source forms: csi:<sensor-id>, v4l2:<index|/dev/videoN>, gst:<pipeline>,
         # rtsp://..., a video file path (loops), or an image path (static stream).
@@ -53,7 +54,7 @@ DEFAULTS: dict[str, Any] = {
         "head_turn_s": 3.0,
         "pitch_down_threshold_deg": 25.0,
         "phone_s": 2.0,
-        "phone_model_threshold": 0.50,
+        "phone_model_threshold": 0.50,  # raises confidence after a phone box is confirmed; never creates one
         "phone_detector_threshold": 0.35,
         "activity_threshold": 0.55,
         "smoking_s": 2.0,
@@ -168,7 +169,7 @@ DEFAULTS: dict[str, Any] = {
         "username": "",
         "password": "",
         "tls": {"enabled": False, "ca_certs": "", "certfile": "", "keyfile": "", "insecure": False},
-        "keepalive": 30,
+        "keepalive": 60,
         "topic_prefix": "dms",
         "heartbeat_s": 30,
         "alert_qos": 1,
@@ -183,7 +184,7 @@ DEFAULTS: dict[str, Any] = {
         "dummy": False,
         "api_url": "http://127.0.0.1:8000",
         "device_key": "dev-media-key",
-        "interval_s": 0.2,
+        "interval_s": 2.0,  # preview stills: driver + passenger, once per interval
         "timeout_s": 5.0,
     },
     # No receiver yet: source "fixed" publishes the single lat/lon below.
