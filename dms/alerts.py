@@ -141,6 +141,14 @@ class AlertBus:
     def emit_analysis(self, channel: str, body: dict) -> None:
         self.analysis_queue.put((channel, body))
 
+    def accepts(self, alert_type: str, reason: str, cooldown_s: float | None = None) -> bool:
+        """True when ``emit`` would pass the cooldown. Safe to call off the lock."""
+        window = self.cooldown_s if cooldown_s is None else cooldown_s
+        now = time.monotonic()
+        with self._lock:
+            last = self._last.get((alert_type, reason))
+            return last is None or now - last >= window
+
     def emit(self, alert: Alert, cooldown_s: float | None = None) -> bool:
         key = (alert.type, alert.reason)
         window = self.cooldown_s if cooldown_s is None else cooldown_s

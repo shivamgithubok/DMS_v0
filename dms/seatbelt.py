@@ -20,12 +20,14 @@ class SeatbeltDetector:
         self.votes: deque = deque(maxlen=window)
         self.on_ratio = on_ratio
         self.off_ratio = off_ratio
+        self._miss = 0  # frames in a row where the chest could not be scored
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
         self.last_lines: list = []
         self._fld = None
 
     def reset(self) -> None:
         self.votes.clear()
+        self._miss = 0
 
     def score(self, frame: np.ndarray, face_bbox) -> float | None:
         h, w = frame.shape[:2]
@@ -76,18 +78,30 @@ class SeatbeltDetector:
 
     def update(self, frame: np.ndarray, face_bbox) -> str:
         if face_bbox is None:
+            self._miss += 1
             return self.state()
         value = self.score(frame, face_bbox)
-        if value is not None:
-            self.votes.append(value >= 0.6)
+        if value is None:
+            self._miss += 1
+            return self.state()
+        self._miss = 0
+        self.votes.append(value >= 0.6)
         return self.state()
 
     def state(self) -> str:
-        if len(self.votes) < max(10, self.votes.maxlen // 3):
+        # A few frames with the chest out of view are Unknown. Old votes stay, so the
+        # next good frame does not have to fill the window again, and Off does not
+        # keep counting while the camera cannot see the belt.
+        if self._miss >= 3:
             return "Unknown"
-        ratio = sum(self.votes) / len(self.votes)
+        count = len(self.votes)
+        full = self.votes.maxlen or count
+        if count == 0 or (count < max(10, full // 3) and count < full):
+            return "Unknown"
+        ratio = sum(self.votes) / count
         if ratio >= self.on_ratio:
             return "On"
-        if ratio <= self.off_ratio:
+        # Off waits for the whole window. A short occlusion stays Unknown and does not alert.
+        if count >= full and ratio <= self.off_ratio:
             return "Off"
         return "Unknown"

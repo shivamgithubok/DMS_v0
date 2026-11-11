@@ -489,6 +489,9 @@ class VlmClient:
             "max_tokens": max_tokens,
             "temperature": temperature,
             "stream": False,
+            # Each cabin picture is different. The server's prompt cache would keep every
+            # one of them (default cap 8 GB) and the Jetson's unified RAM climbs forever.
+            "cache_prompt": False,
             # Qwen3.5 spends the token budget on hidden reasoning unless this is set.
             "chat_template_kwargs": {"enable_thinking": False},
         }

@@ -14,7 +14,6 @@ import tempfile
 import threading
 import time
 import urllib.error
-import urllib.request
 from collections import deque
 from pathlib import Path
 
@@ -22,6 +21,7 @@ import cv2
 import numpy as np
 
 from . import alerts as A
+from .cloud_api import post_json
 
 log = logging.getLogger("dms.clips")
 
@@ -90,15 +90,25 @@ class ClipRecorder(threading.Thread):
         self.sample_s = sample_s
         self._halt = threading.Event()
         self._lock = threading.Lock()
-        self._rings: dict[str, deque] = {"dms": deque(), "cms": deque()}
+        # Hard cap as well as the time window. A clock step must not let the ring grow.
+        span_s = (before_ms + after_ms + 1000) / 1000.0
+        limit = max(4, int(span_s / max(0.05, sample_s)) + 2)
+        self._rings: dict[str, deque] = {"dms": deque(maxlen=limit), "cms": deque(maxlen=limit)}
         self.uploaded = 0
         self.errors = 0
+        self._upload_lock = threading.Lock()
+        self._upload_busy = False
         bus.subscribe(self._on_alert)
 
     def stop(self) -> None:
         self._halt.set()
 
     def _on_alert(self, alert: A.Alert) -> None:
+        with self._upload_lock:
+            if self._upload_busy:
+                log.info("clip upload already running, skipping %s", alert.id)
+                return
+            self._upload_busy = True
         threading.Thread(target=self._upload, args=(alert,), name="clip-upload", daemon=True).start()
 
     def _grab(self, channel: str) -> np.ndarray | None:
@@ -141,43 +151,44 @@ class ClipRecorder(threading.Thread):
             self._halt.wait(self.sample_s)
 
     def _upload(self, alert: A.Alert) -> None:
-        if self.after_ms > 0:
-            if self._halt.wait(self.after_ms / 1000):
-                return
-        channel = clip_channel(alert)
-        alert_ms = int(alert.timestamp * 1000)
-        with self._lock:
-            samples = list(self._rings.get(channel) or [])
-        frames = frames_for_alert(samples, alert_ms, self.before_ms, self.after_ms)
-        if not frames:
-            image = self._grab(channel)
-            if image is None:
-                log.warning("alert %s has no frames for a clip", alert.id)
-                return
-            ok, buf = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 60])
-            if not ok:
-                return
-            frames = [(alert_ms, buf.tobytes())]
-        body = {
-            "key": self.cfg.device_key,
-            "channel": channel,
-            "alert_id": alert.id,
-            "start_at": frames[0][0],
-            "end_at": frames[-1][0],
-            "frames": [{"at": at, "image_b64": base64.b64encode(raw).decode()} for at, raw in frames],
-        }
         try:
-            body["video_b64"] = base64.b64encode(encode_clip_mp4(frames)).decode()
-        except (OSError, RuntimeError, ValueError) as exc:
-            log.warning("clip mp4 encode failed for %s: %s", alert.id, exc)
-        url = self.cfg.api_url.rstrip("/") + f"/v1/devices/{self.device_id}/clips"
-        req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=float(self.cfg.timeout_s)) as resp:
-                payload = json.loads(resp.read().decode() or "{}")
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
-            self.errors += 1
-            log.warning("clip upload failed for %s: %s", alert.id, exc)
-            return
-        self.uploaded += 1
-        log.info("clip %s for alert %s (%d frames)", payload.get("id"), alert.id, len(frames))
+            if self.after_ms > 0 and self._halt.wait(self.after_ms / 1000):
+                return
+            channel = clip_channel(alert)
+            alert_ms = int(alert.timestamp * 1000)
+            with self._lock:
+                samples = list(self._rings.get(channel) or [])
+            frames = frames_for_alert(samples, alert_ms, self.before_ms, self.after_ms)
+            if not frames:
+                image = self._grab(channel)
+                if image is None:
+                    log.warning("alert %s has no frames for a clip", alert.id)
+                    return
+                ok, buf = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                if not ok:
+                    return
+                frames = [(alert_ms, buf.tobytes())]
+            body = {
+                "key": self.cfg.device_key,
+                "channel": channel,
+                "alert_id": alert.id,
+                "start_at": frames[0][0],
+                "end_at": frames[-1][0],
+                "frames": [{"at": at, "image_b64": base64.b64encode(raw).decode()} for at, raw in frames],
+            }
+            try:
+                body["video_b64"] = base64.b64encode(encode_clip_mp4(frames)).decode()
+            except (OSError, RuntimeError, ValueError) as exc:
+                log.warning("clip mp4 encode failed for %s: %s", alert.id, exc)
+            url = self.cfg.api_url.rstrip("/") + f"/v1/devices/{self.device_id}/clips"
+            try:
+                payload = post_json(url, body, 30.0)
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
+                self.errors += 1
+                log.warning("clip upload failed for %s: %s", alert.id, exc)
+                return
+            self.uploaded += 1
+            log.info("clip %s for alert %s (%d frames)", payload.get("id"), alert.id, len(frames))
+        finally:
+            with self._upload_lock:
+                self._upload_busy = False

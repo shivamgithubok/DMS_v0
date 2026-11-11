@@ -7,12 +7,15 @@ Per frame (640x480, target >= 15 FPS on Orin Nano 15 W):
 Every Nth frame: NanoDet phone/cup detector, palm (hand) detector, seatbelt check.
 Every ~2 s: SFace driver identification.
 
-Temporal rules turn per-frame signals into alerts:
-  EAR < threshold for > 1.5 s            -> DISTRACTION (eyes_closed)
-  |head yaw| > 30 deg for > 2 s          -> DISTRACTION (head_turned)
-  gaze off-road / head down for > 2 s    -> DISTRACTION (gaze_away / looking_down)
-  phone in hand or hand at ear for > 1 s -> DISTRACTION (phone_usage)
-  drowsy head, cigarette, drink, no belt, no driver -> their own alert types
+Temporal rules turn per-frame signals into one alert per episode:
+  measured EAR below threshold for > 2.5 s                         -> eyes closed
+  gaze off road for > 3 s                                          -> one distraction card
+  phone box in reach, hand on it or phone at ear, for > 2 s       -> phone
+  eyes closed much of the last minute, or a yawn the model agrees with -> drowsiness
+  cup or bottle at the mouth with a hand on it for > 2 s          -> drinking
+  cigarette score with a hand at the mouth for > 2 s              -> smoking
+  seatbelt Off across a full vote window, then > 10 s             -> seatbelt
+  face missing > 5 s on a usable frame                             -> driver absent
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ from .driver_id import DriverIdentifier, DriverRoster
 from .face import (FaceDetector, HeadPose, MeshTopology, create_landmarker, eye_aspect_ratio, eye_crop,
                    geometric_yaw, iris_ratio)
 from .inference import Timer, create_session
+from .logutil import StateLog
 from .objects import COCO_PHONE, DRINK_CLASSES, HandDetector, PhoneDetector, overlap
 from .seatbelt import SeatbeltDetector
 from .state import DriverState, Identity
@@ -113,19 +117,200 @@ class DriverModel:
             h.clear()
 
 
-class Hold:
-    """Tracks how long a condition has been continuously true."""
+# A phone box must sit mostly inside the driver's reach, and either a hand must cover
+# part of that box or the box must sit in an ear zone. The activity head never creates a box.
+_PHONE_IN_REACH = 0.5
+_PHONE_IN_HAND = 0.2
+_PHONE_AT_EAR = 0.3
+_HAND_AT_MOUTH = 0.3
+# Share of the last minute the eyes were measured closed. Normal blinking stays under this.
+_PERCLOS_ALERT = 0.15
+_PERCLOS_WINDOW_S = 60.0
+_PERCLOS_MIN_SPAN_S = 20.0
+# Gaze-head labels this weak used to count as eyes off the road.
+_MODEL_GAZE_AWAY = 0.70
 
-    def __init__(self, seconds: float) -> None:
+
+def driver_reach(face) -> tuple:
+    x1, y1, x2, y2 = face
+    fw, fh = x2 - x1, y2 - y1
+    return (x1 - 2.2 * fw, y1 - 0.3 * fh, x2 + 2.2 * fw, y2 + 2.6 * fh)
+
+
+def ear_zones(face) -> tuple:
+    x1, y1, x2, y2 = face
+    fw, fh = x2 - x1, y2 - y1
+    return ((x1 - 0.7 * fw, y1 + 0.1 * fh, x1 + 0.2 * fw, y2 + 0.35 * fh),
+            (x2 - 0.2 * fw, y1 + 0.1 * fh, x2 + 0.7 * fw, y2 + 0.35 * fh))
+
+
+def assess_phone(face, objects, hands, activity_phone: float,
+                 detector_threshold: float, model_threshold: float):
+    """Return (using, confidence, box, reason).
+
+    Using a phone requires a detector box inside the driver's reach, plus a hand on
+    that box or the box at the ear. ``activity_phone`` can raise confidence once a box
+    is confirmed. A hand at the ear, or a high activity score, does not create a phone.
+    ``reason`` is ``ok``, ``no_face``, ``no_box``, or ``not_in_hand``.
+    """
+    if not face:
+        return False, 0.0, None, "no_face"
+    reach = driver_reach(face)
+    phone_box, phone_score = None, 0.0
+    for box, score, cls in objects:
+        if cls != COCO_PHONE or score < detector_threshold or score <= phone_score:
+            continue
+        if overlap(box, reach) < _PHONE_IN_REACH:
+            continue
+        phone_box, phone_score = box, float(score)
+    if phone_box is None:
+        return False, 0.0, None, "no_box"
+    zones = ear_zones(face)
+    at_ear = any(overlap(phone_box, zone) > _PHONE_AT_EAR for zone in zones)
+    in_hand = any(overlap(phone_box, hand[:4]) > _PHONE_IN_HAND for hand in hands)
+    if not (at_ear or in_hand):
+        return False, 0.0, None, "not_in_hand"
+    confidence = phone_score
+    if activity_phone >= model_threshold:
+        confidence = max(confidence, float(activity_phone))
+    return True, float(min(1.0, confidence)), phone_box, "ok"
+
+
+def mouth_zone(face) -> tuple:
+    x1, y1, x2, y2 = face
+    fw, fh = x2 - x1, y2 - y1
+    return (x1 + 0.1 * fw, y1 + 0.55 * fh, x2 - 0.1 * fw, y2 + 0.45 * fh)
+
+
+def eyes_are_closed(face_found: bool, ear, threshold) -> bool:
+    """A measured eyelid closure. A model label with no EAR does not count."""
+    return bool(face_found and ear is not None and threshold is not None and ear < threshold)
+
+
+def measured_closure(face_found: bool, ear, threshold, model_p_closed) -> bool | None:
+    """One PERCLOS sample, or None when this frame has no measurement.
+
+    EAR wins when landmarks fitted. If the mesh drops (common once the eyes shut)
+    a high eye-state score still counts, so the minute-long fraction is not built
+    only from the frames where the eyes were open enough to fit. A weak score is
+    left out rather than recorded as open.
+    """
+    if not face_found:
+        return None
+    if ear is not None and threshold is not None:
+        return bool(ear < threshold)
+    if model_p_closed is not None and float(model_p_closed) >= 0.8:
+        return True
+    return None
+
+
+def choose_distraction(eyes_closed: bool, phone: bool, looking_down: bool, gaze_away: bool) -> str | None:
+    """One distraction episode, one reason. A head turn by itself is not an alert."""
+    if eyes_closed:
+        return "eyes_closed"
+    if phone:
+        return "phone_usage"
+    if looking_down:
+        return "looking_down"
+    if gaze_away:
+        return "gaze_away"
+    return None
+
+
+def perclos(samples, now: float, window_s: float = _PERCLOS_WINDOW_S,
+            min_span_s: float = _PERCLOS_MIN_SPAN_S) -> float | None:
+    """Fraction of measured frames in the window whose eyes were closed."""
+    recent = [(t, closed) for t, closed in samples if now - window_s <= t <= now]
+    if len(recent) < 2 or recent[-1][0] - recent[0][0] < min_span_s:
+        return None
+    return sum(1 for _, closed in recent if closed) / len(recent)
+
+
+def drowsy_evidence(closure, yawning: bool, model_drowsy: bool, minimum: float = _PERCLOS_ALERT) -> bool:
+    """Drowsiness is a minute of eye closure, or a yawn the drowsiness head agrees with."""
+    if closure is not None and closure >= minimum:
+        return True
+    return bool(yawning and model_drowsy)
+
+
+def assess_drink(face, objects, hands, activity_drink: float,
+                 detector_threshold: float, model_threshold: float):
+    """Return (drinking, confidence, reason). A cup score or the activity head cannot create it alone."""
+    if not face:
+        return False, 0.0, "no_face"
+    reach = driver_reach(face)
+    mouth = mouth_zone(face)
+    box, score = None, 0.0
+    for candidate, candidate_score, cls in objects:
+        if cls not in DRINK_CLASSES or candidate_score < detector_threshold or candidate_score <= score:
+            continue
+        if overlap(candidate, reach) < _PHONE_IN_REACH or overlap(candidate, mouth) <= 0.2:
+            continue
+        box, score = candidate, float(candidate_score)
+    if box is None:
+        return False, 0.0, "no_box"
+    if not any(overlap(box, hand[:4]) > _PHONE_IN_HAND for hand in hands):
+        return False, 0.0, "not_in_hand"
+    confidence = score
+    if activity_drink >= model_threshold:
+        confidence = max(confidence, float(activity_drink))
+    return True, float(min(1.0, confidence)), "ok"
+
+
+def assess_smoke(face, hands, activity_label: str, activity_conf: float, model_threshold: float):
+    """Return (smoking, confidence, reason). The cigarette label needs a hand at the mouth."""
+    if not face:
+        return False, 0.0, "no_face"
+    if activity_label != "Cigarette" or activity_conf < model_threshold:
+        return False, 0.0, "not_cigarette"
+    mouth = mouth_zone(face)
+    if not any(overlap(hand[:4], mouth) > _HAND_AT_MOUTH for hand in hands):
+        return False, 0.0, "no_hand"
+    return True, float(min(1.0, activity_conf)), "ok"
+
+
+def view_blocked(image) -> bool:
+    """A flat black or flat white frame is a covered or blinded camera, not an empty seat."""
+    if image is None or getattr(image, "size", 0) == 0:
+        return False
+    sample = image[::8, ::8]
+    if sample.size == 0:
+        return False
+    mean = float(sample.mean())
+    std = float(sample.std())
+    return std < 4.0 and (mean < 12.0 or mean > 248.0)
+
+
+class Hold:
+    """Tracks how long a condition has been continuously true.
+
+    ``gap_s`` keeps the timer across a short dropout. Phone, drink, and smoke boxes
+    arrive from a slower thread and the hand overlap flickers; without this, a single
+    missed cycle resets a 2 s rule and the alert never fires.
+    """
+
+    def __init__(self, seconds: float, gap_s: float = 0.0) -> None:
         self.seconds = seconds
+        self.gap_s = gap_s
         self.since: float | None = None
+        self._gap_since: float | None = None
 
     def update(self, active: bool, now: float) -> float:
         if active:
+            self._gap_since = None
             if self.since is None:
                 self.since = now
             return now - self.since
+        if self.since is None or self.gap_s <= 0:
+            self.since = None
+            self._gap_since = None
+            return 0.0
+        if self._gap_since is None:
+            self._gap_since = now
+        if now - self._gap_since <= self.gap_s:
+            return now - self.since
         self.since = None
+        self._gap_since = None
         return 0.0
 
     def held(self, now: float) -> float:
@@ -187,12 +372,18 @@ class ObjectWorker(threading.Thread):
         self.objects: list = []
         self.hands: list = []
         self.ts = 0.0  # capture timestamp of the frame the boxes belong to
+        self._ready = False
         self.timer = Timer()
 
     def submit(self, image: np.ndarray, ts: float) -> None:
         with self._cond:
             self._frame = (image, ts)
             self._cond.notify()
+
+    def snapshot(self) -> tuple:
+        """Boxes, hands, capture time, and whether a result has been published."""
+        with self._cond:
+            return list(self.objects), list(self.hands), self.ts, self._ready
 
     def stop(self) -> None:
         self._halt.set()
@@ -216,7 +407,9 @@ class ObjectWorker(threading.Thread):
                 except Exception:
                     log.exception("object detector failed")
                     objects, hands = [], []
-            self.objects, self.hands, self.ts = objects, hands, ts
+            with self._cond:
+                self.objects, self.hands, self.ts = list(objects), list(hands), ts
+                self._ready = True
             rest = self.period - (time.monotonic() - started)
             if rest > 0:
                 self._halt.wait(rest)
@@ -254,19 +447,27 @@ class DriverMonitor(threading.Thread):
         self.pose = HeadPose()
         self.topology = MeshTopology()
 
+        gap = float(rt.object_hold_s)
         self.holds = {
             "eyes_closed": Hold(rt.eyes_closed_s),
             "head_turned": Hold(rt.head_turn_s),
             "gaze_away": Hold(rt.head_turn_s),
             "looking_down": Hold(rt.head_turn_s),
-            "phone": Hold(rt.phone_s),
+            "phone": Hold(rt.phone_s, gap_s=gap),
             "drowsy": Hold(rt.drowsy_s),
-            "smoking": Hold(rt.smoking_s),
-            "drinking": Hold(rt.drinking_s),
+            "smoking": Hold(rt.smoking_s, gap_s=gap),
+            "drinking": Hold(rt.drinking_s, gap_s=gap),
             "seatbelt_off": Hold(rt.seatbelt_off_s),
             "no_face": Hold(rt.no_face_s),
         }
+        self.trace = StateLog(log)
+        self._phone_why = ""
+        self._drink_why = ""
+        self._smoke_why = ""
         self.ear_history: deque = deque(maxlen=900)  # ~30 s of open-eye EAR samples
+        self.eye_closure: deque = deque(maxlen=1800)  # ~60 s of measured open/closed eyes
+        self._drink_conf = 0.0
+        self._smoke_conf = 0.0
         self.blinks: deque = deque()
         self._eye_closed_since: float | None = None
         self.frame_index = 0
@@ -371,12 +572,16 @@ class DriverMonitor(threading.Thread):
         self._identify(ds, image, face, now)
         marks.append(("identify", time.perf_counter()))
         if self.seatbelt is not None:
-            if self.frame_index % 5 == 0 and face:  # belt state changes slowly
-                ds.seatbelt = self.seatbelt.update(image, face.bbox)
+            if self.frame_index % 5 == 0:  # belt state changes slowly; a missing face still counts as a miss
+                ds.seatbelt = self.seatbelt.update(image, face.bbox if face else None)
             else:
                 ds.seatbelt = self.seatbelt.state()
         marks.append(("seatbelt", time.perf_counter()))
         ds.identity = self.identity
+        p_closed = self.model.p(self._last_preds, "eye_state", "Closed") if self._last_preds else None
+        sample = measured_closure(ds.face_found, ds.ear, ds.ear_threshold, p_closed)
+        if sample is not None:
+            self.eye_closure.append((now, sample))
         self._rules(ds, image, now)
         marks.append(("rules", time.perf_counter()))
         for (_, t0), (name, t1) in zip(marks, marks[1:]):
@@ -498,7 +703,7 @@ class DriverMonitor(threading.Thread):
         label, conf = g["label"], g["conf"]
         model_side = "Left" if "Left" in label else "Right" if "Right" in label else None
         vertical = "Up" if label.startswith("Top") else "Down" if label.startswith("Bottom") else ""
-        model_away = conf >= 0.55 and label not in ("Middle-Left", "Middle-Right")
+        model_away = conf >= _MODEL_GAZE_AWAY and label not in ("Middle-Left", "Middle-Right")
         angle = None
         if yaw is not None:
             eye_term = 0.0 if ds.iris is None else (0.5 - ds.iris) * 150.0  # iris 0.3 -> ~30 deg
@@ -529,34 +734,26 @@ class DriverMonitor(threading.Thread):
         objects, hands = [], []
         if worker is not None:
             worker.submit(image, now)
-            if now - worker.ts < rt.object_hold_s:
-                objects, hands = worker.objects, worker.hands
+            objects, hands, seen, ready = worker.snapshot()
+            if not ready or now - seen >= rt.object_hold_s:
+                objects, hands = [], []
         ds.hands = hands
 
         face = ds.face_bbox
-        phone_box, phone_det = None, 0.0
-        drink_near = False
+        self._drink_conf = 0.0
+        self._smoke_conf = 0.0
+        self._phone_why = self._drink_why = self._smoke_why = "no_face"
         if face:
-            x1, y1, x2, y2 = face
-            fw, fh = x2 - x1, y2 - y1
-            reach = (x1 - 2.2 * fw, y1 - 0.3 * fh, x2 + 2.2 * fw, y2 + 2.6 * fh)  # driver's arm reach
-            mouth = (x1 + 0.1 * fw, y1 + 0.55 * fh, x2 - 0.1 * fw, y2 + 0.45 * fh)
-            for box, score, cls in objects:
-                if overlap(box, reach) < 0.5:
-                    continue  # belongs to a passenger / background
-                if cls == COCO_PHONE and score > phone_det:
-                    phone_box, phone_det = box, score
-                elif cls in DRINK_CLASSES and overlap(box, mouth) > 0.2:
-                    drink_near = True
-            ear_zones = ((x1 - 0.7 * fw, y1 + 0.1 * fh, x1 + 0.2 * fw, y2 + 0.35 * fh),
-                         (x2 - 0.2 * fw, y1 + 0.1 * fh, x2 + 0.7 * fw, y2 + 0.35 * fh))
-            hand_at_ear = any(overlap(hb[:4], zone) > 0.3 for hb in hands for zone in ear_zones)
+            y2 = face[3]
+            fh = y2 - face[1]
+            zones = ear_zones(face)
+            hand_at_ear = any(overlap(hb[:4], zone) > 0.3 for hb in hands for zone in zones)
             hand_on_face = any(overlap(hb[:4], face) > 0.3 for hb in hands)
-            phone_at_ear = phone_box is not None and any(overlap(phone_box, z) > 0.3 for z in ear_zones)
-            chest = (x1 - 1.5 * fw, y2 - 0.2 * fh, x2 + 1.5 * fw, y2 + 2.0 * fh)
-            hand_on_phone = phone_box is not None and (any(overlap(phone_box, hb[:4]) > 0.1 for hb in hands)
-                                                       or overlap(phone_box, chest) > 0.6)
-            if phone_box is not None and (phone_at_ear or hand_on_phone):
+            p_model = self.model.p(self._last_preds, "activity", "Phone Use") if self._last_preds else 0.0
+            ds.phone, ds.phone_conf, phone_box, self._phone_why = assess_phone(
+                face, objects, hands, p_model, rt.phone_detector_threshold, rt.phone_model_threshold)
+            ds.phone_box = phone_box
+            if ds.phone:
                 ds.hand_position = "On Phone"
             elif hand_at_ear:
                 ds.hand_position = "Near Ear"
@@ -568,22 +765,11 @@ class DriverMonitor(threading.Thread):
                 ds.hand_position = "Free"
             else:
                 ds.hand_position = "Not Visible"
-            p_model = self.model.p(self._last_preds, "activity", "Phone Use") if self._last_preds else 0.0
-            score = max(phone_det, p_model, 0.7 if hand_at_ear else 0.0)
-            ds.phone = (phone_det >= rt.phone_detector_threshold or p_model >= rt.phone_model_threshold or
-                        hand_at_ear or phone_at_ear)
-            ds.phone_conf = score
-            if ds.phone and phone_box is None:
-                # no detector box (e.g. phone hidden in the hand): box the hand nearest the face
-                near = [hb for hb in hands if overlap(hb[:4], reach) > 0.5]
-                if near:
-                    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-                    hb = min(near, key=lambda b: abs((b[0] + b[2]) / 2 - cx) + abs((b[1] + b[3]) / 2 - cy))
-                    phone_box = hb[:4]
-            ds.phone_box = phone_box if ds.phone else None
-            act = ds.activity
-            ds.smoking = act == "Cigarette" and ds.activity_conf >= rt.activity_threshold
-            ds.drinking = drink_near or (act == "Drinking" and ds.activity_conf >= rt.activity_threshold)
+            drink_activity = ds.activity_conf if ds.activity == "Drinking" else 0.0
+            ds.drinking, self._drink_conf, self._drink_why = assess_drink(
+                face, objects, hands, drink_activity, rt.phone_detector_threshold, rt.activity_threshold)
+            ds.smoking, self._smoke_conf, self._smoke_why = assess_smoke(
+                face, hands, ds.activity, ds.activity_conf, rt.activity_threshold)
 
     _last_preds = None
 
@@ -606,57 +792,79 @@ class DriverMonitor(threading.Thread):
         rt = self.rt
         H = self.holds
         face = ds.face_found
-        eyes_closed = face and (ds.ear is not None and ds.ear < ds.ear_threshold or
-                                ds.ear is None and ds.eye_state == "Closed")
+        eyes_closed = eyes_are_closed(face, ds.ear, ds.ear_threshold)
         H["eyes_closed"].update(eyes_closed, now)
         H["head_turned"].update(face and ds.yaw is not None and abs(ds.yaw) > rt.yaw_threshold_deg, now)
         H["gaze_away"].update(face and ds.gaze_away and ds.gaze in ("Left", "Right", "Up"), now)
         H["looking_down"].update(face and ds.gaze == "Down", now)
         H["phone"].update(face and ds.phone, now)
-        H["drowsy"].update(face and ds.drowsy, now)
+        closure = perclos(self.eye_closure, now)
+        H["drowsy"].update(face and drowsy_evidence(closure, ds.yawning, ds.drowsy), now)
         H["smoking"].update(face and ds.smoking, now)
         H["drinking"].update(face and ds.drinking, now)
         H["seatbelt_off"].update(ds.seatbelt == "Off", now)
-        H["no_face"].update(not face, now)
+        blocked = view_blocked(image)
+        H["no_face"].update((not face) and not blocked, now)
         ds.eyes_closed_s = H["eyes_closed"].held(now)
         ds.head_turned_s = H["head_turned"].held(now)
+        votes = len(self.seatbelt.votes) if self.seatbelt is not None else 0
+        self.trace.change("seatbelt", ds.seatbelt, "seatbelt %s votes=%d", ds.seatbelt, votes, level=logging.INFO)
+        self.trace.change("phone", self._phone_why, "phone evidence %s conf=%.2f", self._phone_why, ds.phone_conf)
+        self.trace.change("drink", self._drink_why, "drink evidence %s conf=%.2f", self._drink_why, self._drink_conf)
+        self.trace.change("smoke", self._smoke_why, "smoke evidence %s conf=%.2f", self._smoke_why, self._smoke_conf)
+        self.trace.rise("head_turned", H["head_turned"].fired(now),
+                        "head turned %.0f deg for %.1fs; recorded, not raised as its own alert",
+                        abs(ds.yaw or 0.0), ds.head_turned_s)
+        self.trace.rise("view_blocked", bool(blocked and not face),
+                        "flat black or white frame; driver-absent timer paused")
 
-        reasons = []
-        if H["phone"].fired(now):
-            reasons.append(("phone_usage", ds.phone_conf, "Phone usage while driving"))
-        if H["eyes_closed"].fired(now):
-            conf = 1.0 - (ds.ear / ds.ear_threshold if ds.ear else 0.0) * 0.5
-            reasons.append(("eyes_closed", conf, f"Eyes closed for {ds.eyes_closed_s:.1f}s"))
-        if H["head_turned"].fired(now):
-            reasons.append(("head_turned", min(1.0, abs(ds.yaw or 0) / 45.0),
-                            f"Head turned {abs(ds.yaw or 0):.0f}° for {ds.head_turned_s:.1f}s"))
-        if H["gaze_away"].fired(now):
-            reasons.append(("gaze_away", 0.75, f"Eyes off road ({ds.gaze.lower()})"))
-        if H["looking_down"].fired(now):
-            reasons.append(("looking_down", 0.7, "Looking down, eyes off road"))
-        ds.distracted = bool(reasons)
-        ds.distraction_reasons = [r[0] for r in reasons]
-        for reason, conf, text in reasons:
-            self._emit(A.DISTRACTION, reason, conf, text, ds, image)
+        chosen = choose_distraction(
+            H["eyes_closed"].fired(now), H["phone"].fired(now),
+            H["looking_down"].fired(now), H["gaze_away"].fired(now))
+        texts = {
+            "eyes_closed": (1.0 - (ds.ear / ds.ear_threshold if ds.ear else 0.0) * 0.5,
+                            f"Eyes closed for {ds.eyes_closed_s:.1f}s"),
+            "phone_usage": (ds.phone_conf, "Phone usage while driving"),
+            "looking_down": (0.7, "Looking down, eyes off road"),
+            "gaze_away": (0.75, f"Eyes off road ({ds.gaze.lower()})"),
+        }
+        ds.distracted = chosen is not None
+        ds.distraction_reasons = [chosen] if chosen else []
+        self.trace.change("distraction", chosen or "", "distraction %s", chosen or "clear", level=logging.INFO)
+        closure_txt = "n/a" if closure is None else f"{closure:.0%}"
+        self.trace.change("perclos", closure_txt, "perclos %s", closure_txt)
+        if chosen:
+            conf, text = texts[chosen]
+            self._emit(A.DISTRACTION, chosen, conf, text, ds, image)
 
         if H["drowsy"].fired(now):
-            self._emit(A.DROWSINESS, "drowsy", self.model.p(self._last_preds, "drowsiness", "Drowsy")
-                       if self._last_preds else 0.7, "Drowsiness signs detected", ds, image)
+            if closure is not None and closure >= _PERCLOS_ALERT:
+                drowsy_text = f"Eyes closed {closure:.0%} of the last minute"
+                drowsy_conf = min(1.0, 0.5 + closure)
+            else:
+                drowsy_text = "Repeated yawning with drowsiness signs"
+                drowsy_conf = self.model.p(self._last_preds, "drowsiness", "Drowsy") if self._last_preds else 0.7
+            self._emit(A.DROWSINESS, "drowsy", drowsy_conf, drowsy_text, ds, image)
         if H["smoking"].fired(now):
-            self._emit(A.SMOKING, "cigarette", ds.activity_conf, "Smoking while driving", ds, image)
+            self._emit(A.SMOKING, "cigarette", self._smoke_conf, "Smoking while driving", ds, image)
         if H["drinking"].fired(now):
-            self._emit(A.DRINKING, "drinking", max(ds.activity_conf, 0.6), "Drinking while driving", ds, image)
+            self._emit(A.DRINKING, "drinking", self._drink_conf, "Drinking while driving", ds, image)
         if H["seatbelt_off"].fired(now):
             self._emit(A.SEATBELT_OFF, "seatbelt", 0.7, "Seatbelt not detected", ds, image, cooldown=60.0)
         if H["no_face"].fired(now) and self.camera.stats.connected:
             self._emit(A.DRIVER_ABSENT, "no_face", 0.9, "Driver face not visible", ds, image, cooldown=30.0)
 
-        if ds.distracted:
+        if ds.distracted and chosen != "eyes_closed":
             ds.overlay_alert = "DISTRACTION DETECTED"
-        elif H["drowsy"].fired(now) or H["eyes_closed"].active and ds.eyes_closed_s > 1.0:
+        elif (H["drowsy"].fired(now) or chosen == "eyes_closed"
+              or (H["eyes_closed"].active and ds.eyes_closed_s > 1.0)):
             ds.overlay_alert = "DROWSINESS DETECTED"
         elif H["smoking"].fired(now):
             ds.overlay_alert = "SMOKING DETECTED"
+        elif H["drinking"].fired(now):
+            ds.overlay_alert = "DRINKING DETECTED"
+        elif H["seatbelt_off"].fired(now):
+            ds.overlay_alert = "SEATBELT NOT DETECTED"
         else:
             ds.overlay_alert = ""
 
@@ -672,8 +880,7 @@ class DriverMonitor(threading.Thread):
         self.bus.emit(alert, cooldown_s=cooldown)
 
     def _would_emit(self, alert: A.Alert, cooldown: float) -> bool:
-        last = self.bus._last.get((alert.type, alert.reason))
-        return last is None or time.monotonic() - last >= cooldown
+        return self.bus.accepts(alert.type, alert.reason, cooldown)
 
 
 def _r(value, digits: int = 1):

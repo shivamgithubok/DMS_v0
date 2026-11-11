@@ -218,26 +218,31 @@ class _GiAppSink:
         sample = self.sink.emit("try-pull-sample", int(timeout_s * 1e9))
         if sample is None:
             return False, None
-        caps = sample.get_caps().get_structure(0)
-        width = caps.get_value("width")
-        height = caps.get_value("height")
-        fmt = caps.get_value("format")
-        buf = sample.get_buffer()
-        ok, info = buf.map(self.Gst.MapFlags.READ)
-        if not ok:
-            return False, None
         try:
-            channels = 4 if fmt in ("BGRx", "BGRA", "RGBA", "RGBx") else 3
-            stride = info.size // height
-            arr = np.ndarray((height, stride), dtype=np.uint8, buffer=info.data)
-            arr = arr[:, : width * channels].reshape(height, width, channels)
-            if channels == 4:
-                image = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
-            else:
-                image = arr.copy()
+            caps = sample.get_caps().get_structure(0)
+            width = caps.get_value("width")
+            height = caps.get_value("height")
+            fmt = caps.get_value("format")
+            buf = sample.get_buffer()
+            ok, info = buf.map(self.Gst.MapFlags.READ)
+            if not ok:
+                return False, None
+            try:
+                channels = 4 if fmt in ("BGRx", "BGRA", "RGBA", "RGBx") else 3
+                stride = info.size // height
+                arr = np.ndarray((height, stride), dtype=np.uint8, buffer=info.data)
+                arr = arr[:, : width * channels].reshape(height, width, channels)
+                if channels == 4:
+                    image = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+                else:
+                    image = arr.copy()
+            finally:
+                buf.unmap(info)
+            return True, image
         finally:
-            buf.unmap(info)
-        return True, image
+            # try-pull-sample gives us a ref. Drop it now so the pool can reuse the
+            # buffer; waiting for GC lets frames pile up in this process.
+            del sample
 
     def isOpened(self) -> bool:  # noqa: N802 - mirrors cv2.VideoCapture
         return True
