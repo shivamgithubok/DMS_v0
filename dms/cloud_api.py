@@ -14,6 +14,13 @@ import urllib.request
 _lock = threading.Lock()
 
 
+def get_json(url: str, timeout: float) -> dict:
+    """A short read. It does not take the post lock, so a place refresh cannot stall a clip upload."""
+    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(request, timeout=timeout) as resp:
+        return json.loads(resp.read().decode() or "{}")
+
+
 def post_json(url: str, body: dict, timeout: float) -> dict:
     request = urllib.request.Request(
         url,

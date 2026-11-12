@@ -11,7 +11,7 @@ WorkingDirectory=/opt/dms
 Environment=DISPLAY=:0
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=-/etc/default/dms
-ExecStartPre=/opt/dms/tools/build_engines.sh
+# Engines are built by setup_jetson.sh. A reboot starts from the cached engine.
 ExecStart=/opt/dms/.venv/bin/python /opt/dms/main.py --fullscreen
 Restart=always
 RestartSec=3

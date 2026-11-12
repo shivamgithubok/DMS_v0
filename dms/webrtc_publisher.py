@@ -19,7 +19,7 @@ import cv2
 import numpy as np
 
 from .cloud_api import post_json
-from .state import WebRtcState
+from .state import ConsentState, WebRtcState
 
 log = logging.getLogger("dms.webrtc")
 
@@ -101,6 +101,16 @@ class WebRtcPublisher(threading.Thread):
     def stop(self) -> None:
         self._halt.set()
 
+    def _note_consent(self, token: dict) -> None:
+        watch = token.get("watchRequest") or {}
+        talk = token.get("talkRequest") or {}
+        self.shared.consent = ConsentState(
+            watch_request=str(watch.get("name") or ""),
+            talk_request=str(talk.get("name") or ""),
+            live=bool(token.get("publish")),
+            talking=bool(token.get("talk")),
+        )
+
     def _publish_state(self, **changes) -> None:
         current = getattr(self.shared, "webrtc", WebRtcState())
         values = {k: getattr(current, k) for k in current.__dataclass_fields__}
@@ -158,6 +168,7 @@ class WebRtcPublisher(threading.Thread):
                 url = str(token_body.get("url") or "")
                 mode = token_body.get("mode") or "dummy"
                 streaming = wants_stream(token_body)
+                self._note_consent(token_body)
                 self._publish_state(
                     status="online",
                     mode=mode,

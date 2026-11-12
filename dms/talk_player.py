@@ -78,9 +78,10 @@ def _guardian_mic(track, publication, participant) -> bool:
 
 
 class TalkPlayer(threading.Thread):
-    def __init__(self, cfg) -> None:
+    def __init__(self, cfg, shared=None) -> None:
         super().__init__(name="talk-player", daemon=True)
         self.cfg = cfg.webrtc
+        self.shared = shared
         self.device_id = cfg.device_id
         self._halt = threading.Event()
 
@@ -142,6 +143,17 @@ class TalkPlayer(threading.Thread):
         while not self._halt.is_set():
             try:
                 token = self._token()
+                if self.shared is not None:
+                    from .state import ConsentState
+
+                    watch = token.get("watchRequest") or {}
+                    talk_ask = token.get("talkRequest") or {}
+                    self.shared.consent = ConsentState(
+                        watch_request=str(watch.get("name") or ""),
+                        talk_request=str(talk_ask.get("name") or ""),
+                        live=bool(token.get("publish")),
+                        talking=bool(token.get("talk")),
+                    )
                 if token.get("talk") and token.get("speakerToken") and token.get("mode") == "livekit":
                     asyncio.run(self._session(token))
             except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:

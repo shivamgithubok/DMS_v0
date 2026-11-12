@@ -202,7 +202,7 @@ class System:
             taken = GuardianRecorder(cfg, self.capture, audio=self.audio)
             taken.start()
             self.workers.append(taken)
-            voice = TalkPlayer(cfg)
+            voice = TalkPlayer(cfg, self.shared)
             voice.start()
             self.workers.append(voice)
         supervisor = threading.Thread(target=self._supervise, name="supervisor", daemon=True)

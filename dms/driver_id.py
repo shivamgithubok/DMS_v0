@@ -63,6 +63,25 @@ class DriverRoster:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self.entries, indent=2))
 
+    def baseline_for(self, driver_id: str) -> float | None:
+        for entry in self.entries:
+            if str(entry.get("driver_id")) != str(driver_id):
+                continue
+            try:
+                return float(entry["ear_baseline"])
+            except (KeyError, TypeError, ValueError):
+                return None
+        return None
+
+    def remember_baseline(self, driver_id: str, baseline: float) -> None:
+        """Store this driver's open-eye EAR. The embedding is left unchanged."""
+        for entry in self.entries:
+            if str(entry.get("driver_id")) != str(driver_id):
+                continue
+            entry["ear_baseline"] = round(float(baseline), 4)
+            self.save()
+            return
+
     def upsert(self, entry: dict) -> None:
         self.entries = [e for e in self.entries if str(e["driver_id"]) != str(entry["driver_id"])]
         self.entries.append(entry)

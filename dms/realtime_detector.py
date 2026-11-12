@@ -269,6 +269,23 @@ def assess_smoke(face, hands, activity_label: str, activity_conf: float, model_t
     return True, float(min(1.0, activity_conf)), "ok"
 
 
+def calibrated_ear(samples, yaml_threshold: float, auto: bool, stored: float | None, known: bool) -> tuple[float, float, float | None]:
+    """Threshold, open-eye reference, and a baseline worth saving.
+
+    The threshold stays between 0.12 and the YAML value. An unknown face uses
+    the YAML value, so a lost identity cannot keep another driver's baseline.
+    """
+    baseline = None
+    if auto and known and stored is not None and len(samples) < 60:
+        baseline = float(stored)
+    elif auto and known and len(samples) >= 60:
+        baseline = float(np.percentile(list(samples), 80))
+    if baseline is None:
+        return float(yaml_threshold), max(float(yaml_threshold) / 0.72, 0.28), None
+    threshold = float(np.clip(0.72 * baseline, 0.12, float(yaml_threshold)))
+    return threshold, baseline, baseline
+
+
 def view_blocked(image) -> bool:
     """A flat black or flat white frame is a covered or blinded camera, not an empty seat."""
     if image is None or getattr(image, "size", 0) == 0:
@@ -459,6 +476,7 @@ class DriverMonitor(threading.Thread):
             "drinking": Hold(rt.drinking_s, gap_s=gap),
             "seatbelt_off": Hold(rt.seatbelt_off_s),
             "no_face": Hold(rt.no_face_s),
+            "camera_blocked": Hold(rt.no_face_s),
         }
         self.trace = StateLog(log)
         self._phone_why = ""
@@ -628,13 +646,14 @@ class DriverMonitor(threading.Thread):
         ds.ear = ear
         if preds is not None and preds["eye_state"]["label"] == "Open" and abs(ds.yaw or 0) < 20:
             self.ear_history.append(ear)
-        threshold = rt.ear_threshold
-        if rt.ear_auto_calibrate and len(self.ear_history) >= 60:
-            baseline = float(np.percentile(self.ear_history, 80))
-            threshold = float(np.clip(0.72 * baseline, 0.12, rt.ear_threshold))
-            open_ref = baseline
-        else:
-            open_ref = max(rt.ear_threshold / 0.72, 0.28)
+        known = bool(self.identity.known) and self.identity.driver_id not in {"", "----"}
+        stored = None
+        if known and self.identifier is not None:
+            stored = self.identifier.roster.baseline_for(self.identity.driver_id)
+        threshold, open_ref, baseline = calibrated_ear(
+            self.ear_history, rt.ear_threshold, bool(rt.ear_auto_calibrate), stored, known)
+        if known and baseline is not None and self.identifier is not None and (stored is None or abs(stored - baseline) >= 0.005):
+            self.identifier.roster.remember_baseline(self.identity.driver_id, baseline)
         ds.ear_threshold = threshold
         ear_pct = float(np.clip((ear - 0.5 * threshold) / max(1e-3, open_ref - 0.5 * threshold), 0.0, 1.0))
         if preds is not None:
@@ -805,6 +824,7 @@ class DriverMonitor(threading.Thread):
         H["seatbelt_off"].update(ds.seatbelt == "Off", now)
         blocked = view_blocked(image)
         H["no_face"].update((not face) and not blocked, now)
+        H["camera_blocked"].update(bool(blocked and not face), now)
         ds.eyes_closed_s = H["eyes_closed"].held(now)
         ds.head_turned_s = H["head_turned"].held(now)
         votes = len(self.seatbelt.votes) if self.seatbelt is not None else 0
@@ -851,7 +871,9 @@ class DriverMonitor(threading.Thread):
             self._emit(A.DRINKING, "drinking", self._drink_conf, "Drinking while driving", ds, image)
         if H["seatbelt_off"].fired(now):
             self._emit(A.SEATBELT_OFF, "seatbelt", 0.7, "Seatbelt not detected", ds, image, cooldown=60.0)
-        if H["no_face"].fired(now) and self.camera.stats.connected:
+        if H["camera_blocked"].fired(now) and self.camera.stats.connected:
+            self._emit(A.CAMERA_BLOCKED, "covered", 0.9, "Camera covered", ds, image, cooldown=30.0)
+        elif H["no_face"].fired(now) and self.camera.stats.connected:
             self._emit(A.DRIVER_ABSENT, "no_face", 0.9, "Driver face not visible", ds, image, cooldown=30.0)
 
         if ds.distracted and chosen != "eyes_closed":
@@ -865,6 +887,8 @@ class DriverMonitor(threading.Thread):
             ds.overlay_alert = "DRINKING DETECTED"
         elif H["seatbelt_off"].fired(now):
             ds.overlay_alert = "SEATBELT NOT DETECTED"
+        elif H["camera_blocked"].fired(now):
+            ds.overlay_alert = "CAMERA COVERED"
         else:
             ds.overlay_alert = ""
 

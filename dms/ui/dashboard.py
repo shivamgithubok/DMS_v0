@@ -15,6 +15,7 @@ Tab cycles ``dms``, ``cms`` (cabin camera, seats, objects) and ``split`` (both v
 
 from __future__ import annotations
 
+import logging
 import math
 import time
 from datetime import datetime
@@ -29,6 +30,8 @@ from PySide6.QtWidgets import QWidget
 
 from .. import alerts as A
 from . import icons
+
+log = logging.getLogger("dms.ui")
 
 W, H = 2576, 1438
 FONT_DIR = Path(__file__).resolve().parent / "fonts"
@@ -70,7 +73,7 @@ LAYOUT = (
     (None, QRectF(1956, 1326, 596, 88)),
 )
 VIDEO_RECT = QRectF(592, 50, 1330, 1118)
-MODES = ("dms", "cms", "split")
+MODES = ("coach", "dms", "cms", "split")
 CMS_LAYOUT = (
     ("Occupancy", QRectF(24, 50, 542, 320)),
     ("Seat Map", QRectF(24, 388, 542, 400)),
@@ -123,8 +126,8 @@ class Dashboard(QWidget):
         self.shared = shared
         self.bus = bus
         self.cfg = cfg
-        self.mode = "dms"
-        self.setWindowTitle("Driver Monitoring System")
+        self.mode = "coach"
+        self.setWindowTitle("Driver coach")
         self.setMinimumSize(960, 536)
         self.resize(1600, 893)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
@@ -142,6 +145,7 @@ class Dashboard(QWidget):
         self.f_tag = _font(23, QFont.Weight.Medium, self.family)
         self.f_callout = _font(27, QFont.Weight.DemiBold, self.family)
         self.f_alert = _font(30, QFont.Weight.Medium, self.family)
+        self.f_coach = _font(64, QFont.Weight.DemiBold, self.family)
         self._frame_cache: dict = {}
         self._bg_image: QImage | None = None
         self._bg_ts = 0.0
@@ -174,8 +178,8 @@ class Dashboard(QWidget):
             return
         self.mode = mode
         self._chrome = None
-        titles = {"dms": "Driver Monitoring System", "cms": "Cabin Monitoring System",
-                  "split": "Driver and Cabin Monitoring"}
+        titles = {"coach": "Driver coach", "dms": "Driver Monitoring System",
+                  "cms": "Cabin Monitoring System", "split": "Driver and Cabin Monitoring"}
         self.setWindowTitle(titles[mode])
         self.update()
 
@@ -201,23 +205,87 @@ class Dashboard(QWidget):
             x += width + 36
         return rects
 
+    def _prompt(self) -> tuple[str, str] | None:
+        state = getattr(self.shared, "consent", None)
+        if state is None:
+            return None
+        if state.watch_request:
+            return "watch", state.watch_request
+        if state.talk_request:
+            return "talk", state.talk_request
+        return None
+
+    def _consent_rects(self) -> list[tuple[QRectF, str]]:
+        if self._prompt() is None:
+            return []
+        return [
+            (QRectF(W / 2 - 360, H - 180, 320, 100), "accept"),
+            (QRectF(W / 2 + 40, H - 180, 320, 100), "deny"),
+        ]
+
+    def decide(self, kind: str, decision: str) -> bool:
+        """Record Accept or Deny. The detector keeps running; the post does not block it."""
+        if self.cfg is not None and getattr(self.cfg, "webrtc", None) is not None:
+            if not self._send_consent(kind, decision):
+                return False
+        state = getattr(self.shared, "consent", None)
+        if state is None:
+            return False
+        if kind == "watch":
+            state.watch_request = ""
+            state.live = decision == "accept"
+        else:
+            state.talk_request = ""
+            state.talking = decision == "accept"
+        self.update()
+        return True
+
+    def _send_consent(self, kind: str, decision: str) -> bool:
+        from dms.cloud_api import post_json
+
+        webrtc = self.cfg.webrtc
+        try:
+            post_json(
+                webrtc.api_url.rstrip("/") + f"/v1/devices/{self.cfg.device_id}/consent",
+                {"key": webrtc.device_key, "kind": kind, "decision": decision},
+                float(getattr(webrtc, "timeout_s", 2.0) or 2.0),
+            )
+            return True
+        except Exception:
+            log.warning("cabin consent post failed")
+            return False
+
+    def hit(self, x: float, y: float) -> str:
+        point = QPointF(x, y)
+        prompt = self._prompt()
+        for rect, decision in self._consent_rects():
+            if rect.contains(point) and prompt is not None:
+                self.decide(prompt[0], decision)
+                return f"{prompt[0]}:{decision}"
+        for rect, mode, _text in self._mode_rects():
+            if rect.contains(point):
+                self.set_mode(mode)
+                return f"mode:{mode}"
+        return ""
+
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
             point = self._to_design(event.position())
-            for rect, mode, _text in self._mode_rects():
-                if rect.contains(point):
-                    self.set_mode(mode)
-                    event.accept()
-                    return
+            if self.hit(point.x(), point.y()):
+                event.accept()
+                return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
         point = self._to_design(event.position())
         over = any(rect.contains(point) for rect, _mode, _text in self._mode_rects())
+        over = over or any(rect.contains(point) for rect, _decision in self._consent_rects())
         self.setCursor(Qt.CursorShape.PointingHandCursor if over else Qt.CursorShape.ArrowCursor)
         super().mouseMoveEvent(event)
 
     def _layout(self):
+        if self.mode == "coach":
+            return ()
         if self.mode == "cms":
             return CMS_LAYOUT
         if self.mode == "split":
@@ -322,12 +390,23 @@ class Dashboard(QWidget):
 
     def render_dynamic(self, p: QPainter) -> None:
         self._modes(p)
-        if self.mode == "cms":
+        self._consent(p)
+        if self.mode == "coach":
+            self._render_coach(p)
+        elif self.mode == "cms":
             self._render_cms(p)
         elif self.mode == "split":
             self._render_split(p)
         else:
             self._render_dms(p)
+
+    def _render_coach(self, p: QPainter) -> None:
+        alert = self.bus.latest()
+        if alert is None:
+            line, color = "Eyes on the road", C.green
+        else:
+            line, color = alert.description or alert.title, C.amber
+        self._text(p, W / 2, H / 2, line, color, self.f_coach, "center", max_w=W - 160)
 
     def _render_dms(self, p: QPainter) -> None:
         ds = self.shared.driver
@@ -857,6 +936,27 @@ class Dashboard(QWidget):
         self._text(p, r.left() + 56, r.top() + 72, text, C.label if mq.enabled else C.dim, self.f_small, max_w=r.width() - 80)
 
     # ------------------------------------------------------------------ modes
+    def _consent(self, p: QPainter) -> None:
+        state = getattr(self.shared, "consent", None)
+        prompt = self._prompt()
+        if state is not None and state.live and prompt is None:
+            self._text(p, W - 28, 78, "LIVE", C.green, self.f_callout, "right")
+        if prompt is None:
+            return
+        kind, name = prompt
+        verb = "watch the cabin" if kind == "watch" else "speak into the cabin"
+        banner = QRectF(W / 2 - 520, H - 300, 1040, 90)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(20, 24, 32, 230))
+        p.drawRoundedRect(banner, 16, 16)
+        self._text(p, banner.center().x(), banner.center().y() + 10, f"{name} wants to {verb}", C.white, self.f_callout, "center")
+        for rect, decision in self._consent_rects():
+            color = C.green if decision == "accept" else C.red
+            p.setPen(QPen(color, 2))
+            p.setBrush(QColor(color.red(), color.green(), color.blue(), 40))
+            p.drawRoundedRect(rect, 14, 14)
+            self._text(p, rect.center().x(), rect.center().y() + 10, decision.upper(), color, self.f_callout, "center")
+
     def _modes(self, p: QPainter) -> None:
         for rect, mode, text in self._mode_rects():
             active = mode == self.mode

@@ -38,6 +38,20 @@ from .state import MqttState
 
 log = logging.getLogger("dms.mqtt")
 
+# Kept until last when the outbox is over its cap. Coaching alerts are dropped first.
+DURABLE_ALERTS = {
+    "DROWSINESS",
+    "DRIVER_ABSENT",
+    "SCREAM",
+    "ALTERCATION",
+    "CHILD_PRESENT",
+    "PASSENGER_AGGRESSIVE",
+    "SOS",
+    "CAMERA_BLOCKED",
+    "ARRIVED",
+    "UNEXPECTED_STOP",
+}
+
 
 class Outbox:
     """Durable FIFO of pending messages (SQLite WAL, safe across threads)."""
@@ -59,11 +73,36 @@ class Outbox:
             cur = self.db.execute("INSERT INTO outbox (topic, payload, qos, created) VALUES (?, ?, ?, ?)",
                                   (topic, payload, qos, time.time()))
             count = self.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
-            if count > self.max_rows:  # bounded disk use: drop the oldest beyond the cap
-                self.db.execute("DELETE FROM outbox WHERE id IN (SELECT id FROM outbox ORDER BY id LIMIT ?)",
-                                (count - self.max_rows,))
-                log.warning("outbox over %d rows, dropped %d oldest", self.max_rows, count - self.max_rows)
+            if count > self.max_rows:
+                self._trim(count - self.max_rows)
             return cur.lastrowid
+
+    def _trim(self, overflow: int) -> None:
+        """Drop coaching rows before drowsiness, SOS, and the other durable alerts."""
+        rows = self.db.execute("SELECT id, payload FROM outbox ORDER BY id").fetchall()
+        bare: list[int] = []
+        coaching: list[int] = []
+        durable: list[int] = []
+        for row_id, payload in rows:
+            kind = ""
+            try:
+                kind = str(json.loads(payload).get("type") or "")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                kind = ""
+            if kind in DURABLE_ALERTS:
+                durable.append(row_id)
+            elif not kind:
+                bare.append(row_id)
+            else:
+                coaching.append(row_id)
+        drop = (bare + coaching)[:overflow]
+        if len(drop) < overflow:
+            drop.extend(durable[: overflow - len(drop)])
+        if not drop:
+            return
+        marks = ",".join("?" for _ in drop)
+        self.db.execute(f"DELETE FROM outbox WHERE id IN ({marks})", drop)
+        log.warning("outbox over %d rows, dropped %d (coaching before durable alerts)", self.max_rows, len(drop))
 
     def due(self, limit: int, retry_after: float, exclude: set) -> list[tuple]:
         now = time.time()

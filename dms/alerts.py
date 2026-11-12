@@ -34,15 +34,33 @@ CHILD_PRESENT = "CHILD_PRESENT"
 OBJECT_ON_SEAT = "OBJECT_ON_SEAT"
 PASSENGER_AGGRESSIVE = "PASSENGER_AGGRESSIVE"
 OCCUPANCY_CHANGE = "OCCUPANCY_CHANGE"
+CAMERA_BLOCKED = "CAMERA_BLOCKED"
+SOS = "SOS"
+ARRIVED = "ARRIVED"
+UNEXPECTED_STOP = "UNEXPECTED_STOP"
 
 CMS_TYPES = {CHILD_PRESENT, OBJECT_ON_SEAT, PASSENGER_AGGRESSIVE, OCCUPANCY_CHANGE}
+
+# The family phone is paged for these. Everything else stays on the cabin screen and the timeline.
+FAMILY_TYPES = {
+    DROWSINESS,
+    DRIVER_ABSENT,
+    SCREAM,
+    ALTERCATION,
+    CHILD_PRESENT,
+    SOS,
+    CAMERA_BLOCKED,
+    ARRIVED,
+    UNEXPECTED_STOP,
+}
 
 SEVERITY = {
     DISTRACTION: "high", PHONE_USAGE: "high", DROWSINESS: "high", DRIVER_ABSENT: "high",
     SMOKING: "medium", DRINKING: "medium", SEATBELT_OFF: "medium", VLM_ALERT: "medium",
     SCREAM: "high", ALTERCATION: "high", ABUSIVE_LANGUAGE: "medium",
     CHILD_PRESENT: "high", OBJECT_ON_SEAT: "medium", PASSENGER_AGGRESSIVE: "high",
-    OCCUPANCY_CHANGE: "low",
+    OCCUPANCY_CHANGE: "low",     CAMERA_BLOCKED: "high", SOS: "critical",
+    ARRIVED: "info", UNEXPECTED_STOP: "high",
 }
 
 TITLES = {
@@ -61,6 +79,10 @@ TITLES = {
     OBJECT_ON_SEAT: "Object On Seat",
     PASSENGER_AGGRESSIVE: "Passenger Aggressive",
     OCCUPANCY_CHANGE: "Occupancy Changed",
+    CAMERA_BLOCKED: "Camera Covered",
+    SOS: "SOS",
+    ARRIVED: "Arrived",
+    UNEXPECTED_STOP: "Unexpected stop",
 }
 
 
@@ -78,6 +100,10 @@ class Alert:
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
     device_id: str = ""
     channel: str = "dms"  # dms | cms
+
+    @property
+    def audience(self) -> str:
+        return "family" if self.type in FAMILY_TYPES else "cabin"
 
     @property
     def severity(self) -> str:
@@ -103,6 +129,7 @@ class Alert:
             "epoch_ms": int(self.timestamp * 1000),
             "description": self.description,
             "channel": self.channel,
+            "audience": self.audience,
         }
         if self.reason:
             body["reason"] = self.reason

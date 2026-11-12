@@ -80,6 +80,120 @@ def _nmea_deg(raw: str, hemi: str, lat: bool) -> float | None:
     return value
 
 
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Distance in metres between two decimal-degree points."""
+    from math import asin, cos, radians, sin, sqrt
+
+    radius = 6_371_000.0
+    phi1, phi2 = radians(lat1), radians(lat2)
+    d_phi = radians(lat2 - lat1)
+    d_lon = radians(lon2 - lon1)
+    a = sin(d_phi / 2) ** 2 + cos(phi1) * cos(phi2) * sin(d_lon / 2) ** 2
+    return 2 * radius * asin(min(1.0, sqrt(a)))
+
+
+def route_point(source: str, fix: str, lat, lon) -> tuple[float, float] | None:
+    """A point that may be drawn on the trip. A configured bench pin is not a route."""
+    if str(source or "") == "fixed" or str(fix or "") != "live":
+        return None
+    lat_v = _coord(lat, -90, 90)
+    lon_v = _coord(lon, -180, 180)
+    if lat_v is None or lon_v is None:
+        return None
+    return lat_v, lon_v
+
+
+def normalize_places(rows) -> list[dict]:
+    places = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        lat = _coord(row.get("lat", row.get("latitude")), -90, 90)
+        lon = _coord(row.get("lon", row.get("longitude")), -180, 180)
+        if lat is None or lon is None:
+            continue
+        try:
+            radius = float(row.get("radius_m") or row.get("radiusM") or 80)
+        except (TypeError, ValueError):
+            radius = 80.0
+        places.append({
+            "id": str(row.get("id") or f"{lat:.4f},{lon:.4f}"),
+            "name": str(row.get("name") or "Home"),
+            "lat": lat,
+            "lon": lon,
+            "radius_m": max(20.0, radius),
+        })
+    return places
+
+
+class PlaceWatch:
+    """One arrival per saved place per trip, and one unexpected stop per hold.
+
+    A fixed point or a stale fix produces nothing.
+    The stop has to hold, and the vehicle has to have moved first, so a bad stick
+    at the curb does not page the family at the start of the trip.
+    """
+
+    def __init__(self, places=None) -> None:
+        self.places = normalize_places(places)
+        self.arrived: set[str] = set()
+        self.moved_m = 0.0
+        self._last: tuple[float, float, float] | None = None
+        self._anchor: tuple[float, float, float] | None = None
+        self.stopped = False
+
+    def consider(
+        self,
+        *,
+        source: str,
+        fix: str,
+        fresh: bool,
+        lat: float,
+        lon: float,
+        at_s: float,
+        hold_s: float = 120.0,
+        move_m: float = 80.0,
+        gap_s: float = 15.0,
+    ) -> list[dict]:
+        if not fresh or route_point(source, fix, lat, lon) is None:
+            return []
+        if self._last is not None and at_s - self._last[2] > gap_s:
+            self._anchor = None
+            self.stopped = False
+        if self._last is not None:
+            self.moved_m += haversine_m(self._last[0], self._last[1], lat, lon)
+        events = []
+        inside = None
+        for place in self.places:
+            if haversine_m(lat, lon, place["lat"], place["lon"]) > place["radius_m"]:
+                continue
+            inside = place
+            if place["id"] in self.arrived:
+                continue
+            self.arrived.add(place["id"])
+            events.append({
+                "type": "ARRIVED",
+                "reason": place["id"],
+                "description": f"Arrived at {place['name']}",
+            })
+        if inside is not None:
+            self._anchor = None
+            self.stopped = False
+        else:
+            if self._anchor is None or haversine_m(self._anchor[0], self._anchor[1], lat, lon) > 30:
+                self._anchor = (lat, lon, at_s)
+                self.stopped = False
+            elif not self.stopped and self.moved_m >= move_m and at_s - self._anchor[2] >= hold_s:
+                self.stopped = True
+                events.append({
+                    "type": "UNEXPECTED_STOP",
+                    "reason": f"stop-{int(self._anchor[2])}",
+                    "description": "The vehicle has stopped",
+                })
+        self._last = (lat, lon, at_s)
+        return events
+
+
 def _coord(value, low: float, high: float) -> float | None:
     if value is None or value == "":
         return None

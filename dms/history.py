@@ -15,7 +15,12 @@ import logging
 import sqlite3
 import threading
 import time
+import uuid
 from pathlib import Path
+
+from .alerts import ARRIVED, VISION, Alert
+from .cloud_api import get_json
+from .gps import PlaceWatch, route_point
 
 log = logging.getLogger("dms.history")
 
@@ -57,6 +62,12 @@ class HistoryStore:
                 PRIMARY KEY (ride_id, started_at)
             )"""
         )
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(trips)")}
+        if "public_id" not in columns:
+            self.db.execute("ALTER TABLE trips ADD COLUMN public_id TEXT")
+        self.db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS trips_public_id ON trips(public_id) WHERE public_id IS NOT NULL"
+        )
         self.db.execute(
             """CREATE TABLE IF NOT EXISTS trip_points (
                 ride_id TEXT NOT NULL,
@@ -83,13 +94,14 @@ class HistoryStore:
                    WHERE ride_id = ? AND status = 'active'""",
                 (now_ms, self.ride_id),
             )
+            public_id = "trip-" + uuid.uuid4().hex[:12]
             self.db.execute(
                 """INSERT INTO trips (
-                       ride_id, started_at, status, device_id, safety_status, score, alert_count
-                   ) VALUES (?, ?, 'active', ?, 'ok', 100, 0)""",
-                (self.ride_id, now_ms, self.device_id),
+                       ride_id, started_at, status, device_id, safety_status, score, alert_count, public_id
+                   ) VALUES (?, ?, 'active', ?, 'ok', 100, 0, ?)""",
+                (self.ride_id, now_ms, self.device_id, public_id),
             )
-        log.info("trip started ride=%s started_at=%s", self.ride_id, now_ms)
+        log.info("trip started ride=%s trip=%s started_at=%s", self.ride_id, public_id, now_ms)
         return now_ms
 
     def close_trip(self, started_at: int, now_ms: int) -> None:
@@ -182,7 +194,9 @@ class HistoryStore:
 
 def _summary(row: sqlite3.Row) -> dict:
     started = int(row["started_at"])
-    return {
+    keys = row.keys()
+    public_id = row["public_id"] if "public_id" in keys else None
+    body = {
         "startedAt": started,
         "endedAt": None if row["ended_at"] is None else int(row["ended_at"]),
         "status": row["status"],
@@ -192,6 +206,9 @@ def _summary(row: sqlite3.Row) -> dict:
         "start": _pin(row["start_lat"], row["start_lon"], started),
         "end": _pin(row["end_lat"], row["end_lon"], row["end_seen_at"] or row["ended_at"] or started),
     }
+    if public_id:
+        body["id"] = public_id
+    return body
 
 
 def _thin(points: list[dict]) -> list[dict]:
@@ -212,6 +229,14 @@ class TripHistory(threading.Thread):
         self.store = HistoryStore(data_path(str(section.db or "history.sqlite3")), str(section.ride_id), cfg.device_id)
         self.shared = shared
         self.bus = bus
+        self.device_id = str(cfg.get("device_id") or "")
+        gps_cfg = cfg.get("gps") or {}
+        webrtc = cfg.get("webrtc") or {}
+        self.watch = PlaceWatch(gps_cfg.get("places") if isinstance(gps_cfg, dict) else [])
+        self._api = str(webrtc.get("api_url") or "").rstrip("/")
+        self._device_key = str(webrtc.get("device_key") or "")
+        self._gap_s = max(1.0, float(gps_cfg.get("stale_s") or 15)) if isinstance(gps_cfg, dict) else 15.0
+        self._place_poll = 0.0
         self.interval_ms = max(1000, int(float(section.point_interval_s or 10) * 1000))
         self._halt = threading.Event()
         self._closed = False
@@ -221,8 +246,10 @@ class TripHistory(threading.Thread):
     def stop(self) -> None:
         self._halt.set()
 
-    def _on_alert(self, _alert) -> None:
+    def _on_alert(self, alert) -> None:
         if self._closed or not self._started_at:
+            return
+        if getattr(alert, "type", "") == ARRIVED:
             return
         try:
             self.store.add_alert(self._started_at)
@@ -230,12 +257,46 @@ class TripHistory(threading.Thread):
         except sqlite3.ProgrammingError:
             return
 
+    def _refresh_places(self, now: float) -> None:
+        if not self._api or not self.device_id or now - self._place_poll < 30:
+            return
+        self._place_poll = now
+        url = f"{self._api}/v1/devices/{self.device_id}/places?key={self._device_key}"
+        try:
+            body = get_json(url, 2.0)
+        except Exception:
+            return
+        if isinstance(body, dict) and isinstance(body.get("places"), list):
+            self.watch.places = PlaceWatch(body["places"]).places
+
     def _sample(self) -> None:
+        self._refresh_places(time.monotonic())
         gps = self.shared.gps
         if not gps.available or gps.lat is None or gps.lon is None:
             return
+        point = route_point(gps.source, gps.fix, gps.lat, gps.lon)
+        if point is None or not self._started_at:
+            return
         at_ms = int(gps.at or time.time() * 1000)
-        self.store.note_fix(self._started_at, gps.lat, gps.lon, gps.fix or "fixed", at_ms, self.interval_ms)
+        self.store.note_fix(self._started_at, point[0], point[1], "live", at_ms, self.interval_ms)
+        for event in self.watch.consider(
+            source=gps.source,
+            fix=gps.fix,
+            fresh=True,
+            lat=point[0],
+            lon=point[1],
+            at_s=at_ms / 1000.0,
+            gap_s=self._gap_s,
+        ):
+            self.bus.emit(Alert(
+                id=f"{event['type'].lower()}-{self._started_at}-{event['reason']}",
+                type=event["type"],
+                category=VISION,
+                confidence=1.0,
+                description=event["description"],
+                reason=event["reason"],
+                channel="dms",
+            ))
 
     def _publish(self) -> None:
         self.shared.history = self.store.snapshot(self._started_at if self._halt.is_set() else None)

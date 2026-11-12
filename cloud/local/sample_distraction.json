@@ -1,0 +1,13 @@
+{
+  "id": "local-distract-1",
+  "device_id": "orin-nano-01",
+  "type": "DISTRACTION",
+  "category": "vision",
+  "severity": "high",
+  "confidence": 0.74,
+  "timestamp": "2026-10-26T10:00:05.000+00:00",
+  "epoch_ms": 1761472805000,
+  "description": "Gaze left the road corridor",
+  "channel": "dms",
+  "reason": "gaze_away"
+}

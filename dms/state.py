@@ -187,6 +187,16 @@ class WebRtcState:
 
 
 @dataclass
+class ConsentState:
+    """What the cabin is being asked, and whether a watch or talk is live."""
+
+    watch_request: str = ""
+    talk_request: str = ""
+    live: bool = False
+    talking: bool = False
+
+
+@dataclass
 class GpsState:
     """Current vehicle position. ``fix`` is none, fixed (the configured point), or live."""
 
@@ -231,6 +241,7 @@ class SharedState:
         self.audio = AudioState()
         self.mqtt = MqttState()
         self.webrtc = WebRtcState()
+        self.consent = ConsentState()
         self.gps = GpsState()
         self.history = None  # latest trip list for Guardian; rows stay in history.sqlite3
         self.system = None  # telemetry.SystemStats

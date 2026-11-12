@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -70,6 +71,91 @@ def encode_clip_mp4(frames: list[tuple[int, bytes]]) -> bytes:
         return out.read_bytes()
 
 
+class ClipQueue:
+    """One row per alert. A second alert waits here instead of being skipped."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.Lock()
+        self.db = sqlite3.connect(str(self.path), check_same_thread=False, isolation_level=None)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS clip_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                alert_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created REAL NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                not_before REAL NOT NULL DEFAULT 0
+            )"""
+        )
+
+    def put(self, alert: A.Alert) -> None:
+        payload = json.dumps(
+            {
+                "id": alert.id,
+                "type": alert.type,
+                "category": alert.category,
+                "channel": alert.channel,
+                "confidence": alert.confidence,
+                "description": alert.description,
+                "timestamp": alert.timestamp,
+            }
+        )
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO clip_jobs (alert_id, payload, created) VALUES (?, ?, ?)",
+                (alert.id, payload, time.time()),
+            )
+
+    def next_job(self) -> A.Alert | None:
+        with self.lock:
+            row = self.db.execute(
+                "SELECT id, payload FROM clip_jobs WHERE not_before <= ? ORDER BY id LIMIT 1",
+                (time.time(),),
+            ).fetchone()
+        if row is None:
+            return None
+        data = json.loads(row[1])
+        alert = A.Alert(
+            type=data.get("type") or "",
+            category=data.get("category") or "",
+            confidence=float(data.get("confidence") or 0),
+            description=data.get("description") or "",
+            timestamp=float(data.get("timestamp") or time.time()),
+            id=data.get("id") or "",
+            channel=data.get("channel") or "dms",
+        )
+        alert.queue_id = row[0]  # type: ignore[attr-defined]
+        return alert
+
+    def defer(self, alert: A.Alert) -> None:
+        row_id = getattr(alert, "queue_id", None)
+        if row_id is None:
+            return
+        with self.lock:
+            self.db.execute(
+                "UPDATE clip_jobs SET attempts = attempts + 1, not_before = ? WHERE id = ?",
+                (time.time() + 2.0, row_id),
+            )
+
+    def finish(self, alert: A.Alert) -> None:
+        row_id = getattr(alert, "queue_id", None)
+        if row_id is None:
+            return
+        with self.lock:
+            self.db.execute("DELETE FROM clip_jobs WHERE id = ?", (row_id,))
+
+    def count(self) -> int:
+        with self.lock:
+            return int(self.db.execute("SELECT COUNT(*) FROM clip_jobs").fetchone()[0])
+
+    def close(self) -> None:
+        with self.lock:
+            self.db.close()
+
+
 def clip_channel(alert: A.Alert) -> str:
     if alert.channel in {"dms", "cms"}:
         return alert.channel
@@ -79,7 +165,7 @@ def clip_channel(alert: A.Alert) -> str:
 
 
 class ClipRecorder(threading.Thread):
-    def __init__(self, cfg, capture, bus: A.AlertBus, before_ms: int = BEFORE_MS, after_ms: int = AFTER_MS, sample_s: float = 0.5) -> None:
+    def __init__(self, cfg, capture, bus: A.AlertBus, before_ms: int = BEFORE_MS, after_ms: int = AFTER_MS, sample_s: float = 0.5, queue_path: Path | None = None) -> None:
         super().__init__(name="clip-recorder", daemon=True)
         self.cfg = cfg.webrtc
         self.device_id = cfg.device_id
@@ -96,20 +182,35 @@ class ClipRecorder(threading.Thread):
         self._rings: dict[str, deque] = {"dms": deque(maxlen=limit), "cms": deque(maxlen=limit)}
         self.uploaded = 0
         self.errors = 0
-        self._upload_lock = threading.Lock()
-        self._upload_busy = False
+        from .config import data_path
+
+        self.queue = ClipQueue(queue_path or data_path("clip_queue.sqlite3"))
+        self._drain_lock = threading.Lock()
+        self._drainer: threading.Thread | None = None
         bus.subscribe(self._on_alert)
 
     def stop(self) -> None:
         self._halt.set()
 
     def _on_alert(self, alert: A.Alert) -> None:
-        with self._upload_lock:
-            if self._upload_busy:
-                log.info("clip upload already running, skipping %s", alert.id)
+        if alert.type in {A.ARRIVED, A.UNEXPECTED_STOP}:
+            return
+        self.queue.put(alert)
+        self._ensure_drainer()
+
+    def _ensure_drainer(self) -> None:
+        with self._drain_lock:
+            if self._drainer is not None and self._drainer.is_alive():
                 return
-            self._upload_busy = True
-        threading.Thread(target=self._upload, args=(alert,), name="clip-upload", daemon=True).start()
+            self._drainer = threading.Thread(target=self._drain, name="clip-upload", daemon=True)
+            self._drainer.start()
+
+    def _drain(self) -> None:
+        while not self._halt.is_set():
+            alert = self.queue.next_job()
+            if alert is None:
+                return
+            self._upload(alert)
 
     def _grab(self, channel: str) -> np.ndarray | None:
         grabber = self.capture.driver if channel == "dms" else getattr(self.capture, "passenger", None)
@@ -148,6 +249,7 @@ class ClipRecorder(threading.Thread):
                 self._sample()
             except Exception:
                 log.exception("clip sample failed")
+            self._ensure_drainer()
             self._halt.wait(self.sample_s)
 
     def _upload(self, alert: A.Alert) -> None:
@@ -163,9 +265,11 @@ class ClipRecorder(threading.Thread):
                 image = self._grab(channel)
                 if image is None:
                     log.warning("alert %s has no frames for a clip", alert.id)
+                    self.queue.finish(alert)
                     return
                 ok, buf = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 60])
                 if not ok:
+                    self.queue.finish(alert)
                     return
                 frames = [(alert_ms, buf.tobytes())]
             body = {
@@ -185,10 +289,13 @@ class ClipRecorder(threading.Thread):
                 payload = post_json(url, body, 30.0)
             except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
                 self.errors += 1
+                self.queue.defer(alert)
                 log.warning("clip upload failed for %s: %s", alert.id, exc)
                 return
             self.uploaded += 1
+            self.queue.finish(alert)
             log.info("clip %s for alert %s (%d frames)", payload.get("id"), alert.id, len(frames))
-        finally:
-            with self._upload_lock:
-                self._upload_busy = False
+        except Exception:
+            self.errors += 1
+            self.queue.defer(alert)
+            log.exception("clip job failed for %s", alert.id)

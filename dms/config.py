@@ -200,6 +200,9 @@ DEFAULTS: dict[str, Any] = {
         "device": "",  # serial port when source is nmea, e.g. /dev/ttyUSB0
         "baud": 9600,
         "file": "",  # JSON {"lat","lon"} when source is file, e.g. data/gps.json
+        # Saved places. Arrival and an unexpected stop stay off while source is fixed.
+        # A running vehicle also refreshes this list from the guardian API.
+        "places": [],
     },
     # Kept trips for ride-1842. Separate from the MQTT outbox, which deletes rows.
     "history": {
@@ -299,6 +302,9 @@ def load_config(path: str | os.PathLike | None = None, overrides: dict | None = 
     mqtt["port"] = int(os.environ.get("DMS_MQTT_PORT", mqtt["port"]))
     mqtt["username"] = os.environ.get("DMS_MQTT_USERNAME", mqtt["username"])
     mqtt["password"] = os.environ.get("DMS_MQTT_PASSWORD", mqtt["password"])
+    tls_flag = os.environ.get("DMS_MQTT_TLS")
+    if tls_flag is not None and str(tls_flag).strip() != "":
+        mqtt["tls"]["enabled"] = str(tls_flag).strip().lower() in {"1", "true", "yes", "on"}
     merged["audio"]["cochl"]["project_key"] = os.environ.get(
         "COCHL_PROJECT_KEY", merged["audio"]["cochl"]["project_key"]
     )
@@ -308,4 +314,64 @@ def load_config(path: str | os.PathLike | None = None, overrides: dict | None = 
     webrtc["device_key"] = os.environ.get("DMS_MEDIA_DEVICE_KEY", webrtc["device_key"]) or os.environ.get(
         "MEDIA_DEVICE_KEY", webrtc["device_key"]
     )
+    if _env_flag("DMS_REQUIRE_DEVICE_KEY") and str(webrtc["device_key"] or "") in {"", "dev-media-key"}:
+        raise ValueError("DMS_REQUIRE_DEVICE_KEY is set, but the media device key is missing or still dev-media-key")
+    validate_config(merged)
     return Config(merged)
+
+
+def validate_config(cfg: dict) -> None:
+    """Refuse a config that would crash after the cameras open."""
+    errors: list[str] = []
+
+    def section(name: str) -> dict:
+        value = cfg.get(name)
+        if not isinstance(value, dict):
+            errors.append(f"{name} must be a mapping")
+            return {}
+        return value
+
+    def whole_number(path: str, value, low: int, high: int | None = None) -> None:
+        if isinstance(value, bool) or not isinstance(value, int) or value < low or (high is not None and value > high):
+            limit = f"{low} to {high}" if high is not None else f"at least {low}"
+            errors.append(f"{path} must be an integer {limit}")
+
+    def positive(path: str, value) -> None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            errors.append(f"{path} must be a number greater than 0")
+
+    mqtt = section("mqtt")
+    whole_number("mqtt.port", mqtt.get("port"), 1, 65535)
+    if not str(mqtt.get("host") or "").strip():
+        errors.append("mqtt.host must be set")
+    history = section("history")
+    if not str(history.get("ride_id") or "").strip():
+        errors.append("history.ride_id must be set")
+    gps = section("gps")
+    if str(gps.get("source") or "") not in {"fixed", "nmea", "file"}:
+        errors.append("gps.source must be fixed, nmea, or file")
+    realtime = section("realtime")
+    positive("realtime.ear_threshold", realtime.get("ear_threshold"))
+    closed = realtime.get("eyes_closed_s")
+    if isinstance(closed, bool) or not isinstance(closed, (int, float)) or closed < 0:
+        errors.append("realtime.eyes_closed_s must be a number of 0 or more")
+    vlm = section("vlm")
+    positive("vlm.interval_s", vlm.get("interval_s"))
+    level = str(cfg.get("log_level") or "INFO").upper()
+    if level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+        errors.append("log_level must be DEBUG, INFO, WARNING, ERROR, or CRITICAL")
+    cameras = section("cameras")
+    for name in ("driver", "passenger"):
+        camera = cameras.get(name)
+        if not isinstance(camera, dict):
+            errors.append(f"cameras.{name} must be a mapping")
+            continue
+        whole_number(f"cameras.{name}.width", camera.get("width"), 1)
+        whole_number(f"cameras.{name}.height", camera.get("height"), 1)
+        whole_number(f"cameras.{name}.fps", camera.get("fps"), 1)
+    if errors:
+        raise ValueError("invalid config: " + "; ".join(errors))
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
